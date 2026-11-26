@@ -663,6 +663,3 @@ class Store:
                 "alerts": int(getattr(alerts, "rowcount", 0) or 0),
                 "episodes": int(getattr(episodes, "rowcount", 0) or 0),
             }
-
-
-AlertStore = Store  # Backward-compatible alias

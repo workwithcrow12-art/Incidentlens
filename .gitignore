@@ -8,5 +8,4 @@ digests/
 .mypy_cache/
 demo-output/
 .coverage
-.review-cache/
 dist/

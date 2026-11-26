@@ -172,5 +172,4 @@ All endpoints except `/healthz` and `/slack/interactions` require `Authorization
 - `src/incidentlens/investigation/`, `changes/`, `memory/` — Prometheus/Loki/GitHub collectors, anomaly detection, incident similarity, and optional LLM synthesis
 - `src/incidentlens/actions/`, `digest/`, `reports/`, `outputs/` — Guarded command runner, Markdown digests/postmortems/ROI, Slack cards, PagerDuty, and Git archive sync
 - [docs/verification-and-repairs.md](docs/verification-and-repairs.md) — Repair log (R1–R16), verification commands, and staging checklist
-- [docs/doi-chieu-yeu-cau.md](docs/doi-chieu-yeu-cau.md) — Requirements traceability matrix
 - [LICENSE](LICENSE) — MIT License
