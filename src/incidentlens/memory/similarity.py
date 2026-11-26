@@ -1,8 +1,8 @@
-"""Trí nhớ sự cố: tìm các sự cố đã đóng giống với sự cố hiện tại.
+"""Incident memory: retrieve closed incidents similar to the current investigation target.
 
-Dùng điểm tương đồng có cấu trúc (cùng loại cảnh báo, cùng dịch vụ) kết hợp độ trùng từ ngữ.
-Cách này chạy được trên mọi cơ sở dữ liệu và không cần mô hình embedding. Khi số sự cố lớn
-(hàng nghìn trở lên) có thể thay bằng tìm kiếm vector (pgvector) mà không đổi giao diện.
+Uses structured similarity (alert name and service) combined with token Jaccard overlap so it runs
+on SQLite and PostgreSQL without an external embedding model. Can later be swapped for pgvector
+behind the same interface.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ def _tokens(summary: str, labels: dict[str, str]) -> set[str]:
 
 
 def similarity(target: InvestigationTarget, incident: IncidentRecord) -> float:
-    """Điểm 0..1: 0.5 nếu cùng loại cảnh báo, 0.2 nếu cùng dịch vụ, 0.3 theo độ trùng từ ngữ."""
+    """Score in [0, 1]: 0.5 for matching alert name, 0.2 for matching service, 0.3 for token overlap."""
     a = _tokens(target.summary, target.labels)
     b = _tokens(incident.summary, incident.labels)
     overlap = len(a & b) / len(a | b) if a and b else 0.0
@@ -37,17 +37,25 @@ class IncidentMemory:
         self._scan = scan
 
     def find_similar(self, target: InvestigationTarget) -> list[SimilarIncident]:
-        scored = []
+        scored: list[tuple[float, bool, float, IncidentRecord]] = []
         for incident in self._store.closed_incidents(self._scan):
             if incident.fingerprint == target.fingerprint and incident.started_at == target.started_at:
-                continue  # chính là sự cố đang điều tra
+                continue  # Exclude the exact episode currently under investigation
             score = similarity(target, incident)
             if score >= self._min_score:
-                scored.append((score, bool(incident.root_cause), incident.resolved_at, incident))
+                resolved_ts = incident.resolved_at.timestamp() if incident.resolved_at else 0.0
+                scored.append((score, bool(incident.root_cause), resolved_ts, incident))
         scored.sort(key=lambda item: item[:3], reverse=True)
         return [
-            SimilarIncident(incident_id=i.id, score=round(score, 3), service=i.service, name=i.name,
-                            root_cause=i.root_cause, fix=i.fix, duration_minutes=i.duration_minutes,
-                            resolved_at=i.resolved_at)
+            SimilarIncident(
+                incident_id=i.id,
+                score=round(score, 3),
+                service=i.service,
+                name=i.name,
+                root_cause=i.root_cause,
+                fix=i.fix,
+                duration_minutes=i.duration_minutes,
+                resolved_at=i.resolved_at,
+            )
             for score, _, _, i in scored[: self._limit]
         ]

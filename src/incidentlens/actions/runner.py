@@ -1,16 +1,17 @@
-"""Hành động một chạm, có người duyệt.
+"""Human-approved one-click remediation actions.
 
-Nguyên tắc an toàn:
-- Chỉ chạy các hành động nằm trong danh sách cho phép (config/actions.yaml).
-- Chỉ người có tên trong `approvers` mới được bấm. Danh sách rỗng = không ai được phép.
-- AI không có đường nào để gọi vào đây: lối vào duy nhất là nút bấm Slack đã xác thực chữ ký.
-- Lệnh chạy dạng danh sách tham số (không qua shell); tên dịch vụ được kiểm tra trước khi chèn vào.
-- Mặc định tắt (IL_ACTIONS_ENABLED=false): chỉ ghi lại lệnh SẼ chạy, không chạy thật.
+Safety invariants:
+- Only actions defined in the allowlist (config/actions.yaml) can run.
+- Only Slack user IDs listed in `approvers` are authorized; an empty list denies everyone.
+- The LLM has no path to invoke actions: the sole entrypoint is a verified Slack interaction.
+- Commands run as an argument vector without a shell, and service names are validated first.
+- Disabled by default (IL_ACTIONS_ENABLED=false): records a dry-run preview without executing.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal
 
@@ -19,20 +20,23 @@ from pydantic import BaseModel, Field, field_validator
 
 from incidentlens.redact import is_safe_name, redact
 
+Executor = Callable[[list[str], int], Awaitable[tuple[int, str]]]
+
 
 class ActionSpec(BaseModel):
     label: str
     command: list[str] = Field(min_length=1)
     services: list[str] = Field(default_factory=lambda: ["*"])
-    approvers: list[str] = Field(default_factory=list)  # Slack user ID
+    approvers: list[str] = Field(default_factory=list)  # Slack user IDs
     confirm: str | None = None
     timeout_seconds: int = 60
+    cooldown_seconds: int = Field(default=300, ge=0)
 
     @field_validator("command")
     @classmethod
     def _no_empty(cls, value: list[str]) -> list[str]:
         if not value[0].strip():
-            raise ValueError("Lệnh không được rỗng")
+            raise ValueError("Command must not be empty")
         return value
 
     def allows(self, service: str) -> bool:
@@ -58,18 +62,24 @@ class ActionResult(BaseModel):
 
 async def _exec(argv: list[str], timeout: int) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
-        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return -1, f"Quá thời gian {timeout} giây, đã dừng lệnh"
+        return -1, f"Timed out after {timeout}s; process killed"
     return proc.returncode or 0, out.decode(errors="replace")
 
 
 class ActionRunner:
-    def __init__(self, config: ActionsConfig | None = None, enabled: bool = False, executor=_exec) -> None:
+    def __init__(
+        self,
+        config: ActionsConfig | None = None,
+        enabled: bool = False,
+        executor: Executor = _exec,
+    ) -> None:
         self._config = config or ActionsConfig()
         self._enabled = enabled
         self._executor = executor
@@ -83,28 +93,44 @@ class ActionRunner:
         spec = self._config.actions.get(name)
         return spec.label if spec else name
 
-    async def run(self, name: str, service: str, user_id: str) -> ActionResult:
+    def cooldown_for(self, name: str) -> int:
+        spec = self._config.actions.get(name)
+        return spec.cooldown_seconds if spec else 0
+
+    def authorize(self, name: str, service: str, user_id: str) -> ActionResult | None:
         spec = self._config.actions.get(name)
         if spec is None:
-            return ActionResult(status="denied", message=f"Hành động `{name}` không nằm trong danh sách cho phép")
+            return ActionResult(status="denied", message=f"Action `{name}` is not in the allowlist")
         if not is_safe_name(service):
-            return ActionResult(status="denied", message="Tên dịch vụ không hợp lệ")
+            return ActionResult(status="denied", message="Invalid service name")
         if not spec.allows(service):
-            return ActionResult(status="denied", message=f"`{name}` không được phép chạy trên `{service}`")
+            return ActionResult(status="denied", message=f"`{name}` is not allowed on `{service}`")
         if user_id not in spec.approvers:
-            return ActionResult(status="denied", message="Bạn không có quyền duyệt hành động này")
+            return ActionResult(status="denied", message="You are not authorized to approve this action")
+        return None
 
+    async def run(self, name: str, service: str, user_id: str) -> ActionResult:
+        denied = self.authorize(name, service, user_id)
+        if denied is not None:
+            return denied
+        spec = self._config.actions[name]
         argv = [part.replace("{service}", service) for part in spec.command]
         shown = " ".join(argv)
         if not self._enabled:
-            return ActionResult(status="dry-run", output=shown,
-                                message=f"Chế độ thử: lệnh sẽ chạy là `{shown}` (bật IL_ACTIONS_ENABLED để chạy thật)")
+            return ActionResult(
+                status="dry-run",
+                output=shown,
+                message=f"Dry-run: would execute `{shown}` (enable IL_ACTIONS_ENABLED to run for real)",
+            )
         try:
             code, output = await self._executor(argv, spec.timeout_seconds)
         except OSError as exc:
-            return ActionResult(status="failed", output=str(exc), message=f"Không chạy được lệnh: {exc}")
+            return ActionResult(status="failed", output=str(exc), message=f"Failed to start command: {exc}")
         output = redact(output)[-2000:]
         if code == 0:
-            return ActionResult(status="executed", exit_code=0, output=output, message=f"Đã chạy `{shown}` thành công")
-        return ActionResult(status="failed", exit_code=code, output=output,
-                            message=f"Lệnh `{shown}` thất bại (mã {code})")
+            return ActionResult(
+                status="executed", exit_code=0, output=output, message=f"Executed `{shown}` successfully"
+            )
+        return ActionResult(
+            status="failed", exit_code=code, output=output, message=f"Command `{shown}` failed (exit code {code})"
+        )

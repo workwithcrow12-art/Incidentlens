@@ -6,7 +6,7 @@
     {
       "status": "firing",
       "labels": { "alertname": "HighLatency", "service": "auth-service", "severity": "critical" },
-      "annotations": { "summary": "p95 latency 450ms (bình thường 50ms)" },
+      "annotations": { "summary": "p95 latency 450ms (normal 50ms)" },
       "startsAt": "2026-11-12T02:14:00Z",
       "endsAt": "0001-01-01T00:00:00Z",
       "generatorURL": "http://prometheus:9090/graph?g0.expr=latency",
@@ -15,7 +15,7 @@
     {
       "status": "firing",
       "labels": { "alertname": "DiskSpaceLow", "service": "db-replica-02", "severity": "warning" },
-      "annotations": { "summary": "Disk đã dùng 85%" },
+      "annotations": { "summary": "Disk usage at 85%" },
       "startsAt": "2026-11-12T05:00:00Z",
       "endsAt": "0001-01-01T00:00:00Z",
       "fingerprint": "a1b2c3d4e5f60002"
@@ -23,7 +23,7 @@
     {
       "status": "resolved",
       "labels": { "alertname": "ThirdPartyTimeout", "service": "payment-worker", "severity": "info" },
-      "annotations": { "summary": "12 lỗi timeout tới API bên thứ ba" },
+      "annotations": { "summary": "12 timeouts calling third-party API" },
       "startsAt": "2026-11-12T03:10:00Z",
       "endsAt": "2026-11-12T03:14:00Z",
       "fingerprint": "a1b2c3d4e5f60003"

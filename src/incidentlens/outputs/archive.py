@@ -1,16 +1,16 @@
-"""Lưu digest, postmortem và báo cáo thành file Markdown; tùy chọn commit + push lên Git.
+"""Persist digests, postmortems, and ROI reports as Markdown files with optional Git sync.
 
-Bố cục:  <thư mục gốc>/YYYY/MM/digest-YYYYMMDD-HHMM.md
-         <thư mục gốc>/postmortems/INC-0001.md
-         <thư mục gốc>/reports/roi-YYYY-MM.md
+Layout:  <root>/YYYY/MM/digest-YYYYMMDD-HHMM.md
+         <root>/postmortems/INC-0001.md
+         <root>/reports/roi-YYYY-MM.md
 """
 
 from __future__ import annotations
 
-import logging
-import subprocess
 from datetime import datetime
+import logging
 from pathlib import Path
+import subprocess
 from threading import Lock
 
 log = logging.getLogger(__name__)
@@ -41,35 +41,42 @@ class DigestArchive:
         path.write_text(markdown, encoding="utf-8")
         return path
 
-    def _git(self, *args: str) -> subprocess.CompletedProcess:
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True, timeout=60)
 
     def sync(self, message: str) -> bool:
-        """Commit thay đổi và thử push cả khi index sạch. True nghĩa là đã tạo commit mới.
+        """Stage and commit new changes, then push to the first remote even if the index was already clean.
 
-        Lỗi Git chỉ ghi log, không làm hỏng luồng chính.
+        Returns True when a new local commit was created. Git failures are logged without raising.
         """
         if not self._git_push:
             return False
         with self._sync_lock:
             try:
                 if not (self.root / ".git").exists():
-                    log.warning("%s chưa phải Git repo, bỏ qua đồng bộ", self.root)
+                    log.warning("%s is not a Git repository; skipping archive sync", self.root)
                     return False
                 self._git("add", "-A")
                 changed = self._git("diff", "--cached", "--quiet").returncode != 0
                 if changed:
-                    commit = self._git("-c", "user.name=IncidentLens", "-c", "user.email=incidentlens@localhost",
-                                       "commit", "-m", message)
+                    commit = self._git(
+                        "-c",
+                        "user.name=IncidentLens",
+                        "-c",
+                        "user.email=incidentlens@localhost",
+                        "commit",
+                        "-m",
+                        message,
+                    )
                     if commit.returncode != 0:
-                        log.error("git commit thất bại: %s", commit.stderr.strip())
+                        log.error("git commit failed: %s", commit.stderr.strip())
                         return False
                 remotes = self._git("remote").stdout.split()
                 if remotes:
                     push = self._git("push", remotes[0], "HEAD")
                     if push.returncode != 0:
-                        log.error("git push thất bại: %s", push.stderr.strip())
+                        log.error("git push failed: %s", push.stderr.strip())
                 return changed
             except (OSError, subprocess.SubprocessError) as exc:
-                log.error("Đồng bộ Git lỗi: %s", exc)
+                log.error("Git archive sync failed: %s", exc)
                 return False

@@ -1,32 +1,51 @@
-"""Các kiểu dữ liệu dùng chung trong toàn hệ thống."""
+"""Shared domain models across routing, storage, investigation, actions, and reporting."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal
+from typing import Literal, overload
 
 from pydantic import BaseModel, Field, field_validator
 
 AlertStatus = Literal["firing", "resolved"]
+IncidentOrigin = Literal["critical", "escalated"]
+FeedbackVerdict = Literal["up", "down"]
 EvidenceKind = Literal["metric", "log", "change", "dependency", "memory"]
 Confidence = Literal["high", "medium", "low"]
-CONFIDENCE_LABEL = {"high": "Cao", "medium": "Trung bình", "low": "Thấp"}
+CONFIDENCE_LABEL: dict[Confidence, str] = {"high": "High", "medium": "Medium", "low": "Low"}
+
+
+@overload
+def as_utc(dt: datetime) -> datetime: ...
+
+
+@overload
+def as_utc(dt: None) -> None: ...
 
 
 def as_utc(dt: datetime | None) -> datetime | None:
-    """Chuẩn hóa về UTC. Thời gian không có múi giờ được coi là UTC."""
+    """Normalize datetimes to UTC; naive datetimes are treated as UTC."""
     if dt is None:
         return None
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-class Severity(str, Enum):
-    """Ba mức cảnh báo. Mức do luật định tuyến quyết định, không phải AI."""
+class DeliveryStatus(str, Enum):
+    SENT = "sent"
+    FAILED = "failed"
+    NOT_CONFIGURED = "not_configured"
 
-    CRITICAL = "critical"  # 🔴 gọi on-call ngay
-    ACTION = "action"  # 🟡 gom vào digest
-    INFO = "info"  # ⚪ chỉ ghi lại
+    def __bool__(self) -> bool:
+        return self is DeliveryStatus.SENT
+
+
+class Severity(str, Enum):
+    """Alert severity determined strictly by static routing rules, never by an LLM."""
+
+    CRITICAL = "critical"  # Immediate on-call page
+    ACTION = "action"  # Grouped into periodic digest
+    INFO = "info"  # Recorded only
 
     @property
     def icon(self) -> str:
@@ -38,7 +57,7 @@ class Severity(str, Enum):
 
 
 class Alert(BaseModel):
-    """Một cảnh báo đã chuẩn hóa, không phụ thuộc nguồn (Alertmanager, Datadog...)."""
+    """Normalized alert independent of upstream source (Alertmanager, Datadog, etc.)."""
 
     fingerprint: str
     name: str
@@ -49,9 +68,14 @@ class Alert(BaseModel):
     ends_at: datetime | None = None
     source_url: str | None = None
 
-    @field_validator("starts_at", "ends_at")
+    @field_validator("starts_at")
     @classmethod
-    def _utc(cls, value: datetime | None) -> datetime | None:
+    def _utc_required(cls, value: datetime) -> datetime:
+        return as_utc(value)
+
+    @field_validator("ends_at")
+    @classmethod
+    def _utc_optional(cls, value: datetime | None) -> datetime | None:
         return as_utc(value)
 
     @property
@@ -64,7 +88,7 @@ class Alert(BaseModel):
 
 
 class RoutedAlert(BaseModel):
-    """Cảnh báo kèm mức đã được xếp và tên luật đã khớp."""
+    """Alert paired with its classified severity and matched routing rule."""
 
     alert: Alert
     severity: Severity
@@ -72,7 +96,7 @@ class RoutedAlert(BaseModel):
 
 
 class AlertRecord(BaseModel):
-    """Trạng thái một cảnh báo được lưu trong hệ thống."""
+    """Stored state of an alert episode."""
 
     fingerprint: str
     name: str
@@ -90,7 +114,7 @@ class AlertRecord(BaseModel):
 
 
 class Change(BaseModel):
-    """Một thay đổi gần đây (deploy, config, feature flag...)."""
+    """Recent service change (deployment, configuration update, etc.)."""
 
     service: str
     kind: str
@@ -100,11 +124,11 @@ class Change(BaseModel):
     url: str | None = None
 
 
-# ---------- Điều tra ----------
+# ---------- Investigation ----------
 
 
 class Evidence(BaseModel):
-    """Một bằng chứng. Bắt buộc có link về dữ liệu gốc."""
+    """Single piece of collected evidence with a link back to the primary source."""
 
     id: str
     kind: EvidenceKind
@@ -134,7 +158,7 @@ class SimilarIncident(BaseModel):
 
 
 class InvestigationTarget(BaseModel):
-    """Thứ cần điều tra: một cảnh báo 🔴 hoặc một nhóm 🟡 trong digest."""
+    """Target of an automated investigation: a critical incident or an ongoing action group."""
 
     fingerprint: str
     service: str
@@ -145,8 +169,14 @@ class InvestigationTarget(BaseModel):
 
     @classmethod
     def from_record(cls, record: AlertRecord) -> InvestigationTarget:
-        return cls(fingerprint=record.fingerprint, service=record.service, name=record.name,
-                   summary=record.summary, started_at=record.first_seen, labels=record.labels)
+        return cls(
+            fingerprint=record.fingerprint,
+            service=record.service,
+            name=record.name,
+            summary=record.summary,
+            started_at=record.first_seen,
+            labels=record.labels,
+        )
 
 
 class Investigation(BaseModel):
@@ -167,7 +197,7 @@ class InvestigationRecord(BaseModel):
     incident_id: int | None = None
     created_at: datetime
     investigation: Investigation
-    feedback: Literal["up", "down"] | None = None
+    feedback: FeedbackVerdict | None = None
     feedback_hypothesis: int | None = None
     feedback_by: str | None = None
 
@@ -176,7 +206,7 @@ class InvestigationRecord(BaseModel):
 
 
 class AlertGroup(BaseModel):
-    """Nhóm cảnh báo cùng dịch vụ và cùng loại, hiển thị như một mục trong digest."""
+    """Alerts grouped by (service, alert name) for digest rendering."""
 
     service: str
     name: str
@@ -218,11 +248,11 @@ class AlertGroup(BaseModel):
         return next((r.source_url for r in self.records if r.source_url), None)
 
 
-# ---------- Sự cố đã gọi on-call ----------
+# ---------- Paged incidents ----------
 
 
 class IncidentRecord(BaseModel):
-    """Một sự cố đã gọi on-call (🔴 trực tiếp hoặc 🟡 leo thang). Khi đóng lại sẽ thành trí nhớ sự cố."""
+    """An incident that paged on-call (critical or escalated). Closed incidents feed incident memory."""
 
     id: int
     fingerprint: str
@@ -230,7 +260,7 @@ class IncidentRecord(BaseModel):
     name: str
     summary: str
     labels: dict[str, str] = Field(default_factory=dict)
-    origin: Literal["critical", "escalated"]
+    origin: IncidentOrigin
     started_at: datetime
     opened_at: datetime
     resolved_at: datetime | None = None

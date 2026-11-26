@@ -1,4 +1,4 @@
-"""Báo cáo ROI hàng tháng (mục 8.3 của kế hoạch). Mọi con số đều kèm cách tính."""
+"""Monthly ROI reporting with explicit methodology for every metric."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from incidentlens.store import Store
 
 
 class BaselineBefore(BaseModel):
-    """Số đo TRƯỚC khi dùng sản phẩm. Bỏ trống thì báo cáo ghi rõ là chưa có."""
+    """Measured pre-adoption baseline. Null fields are explicitly labeled in the report."""
 
     interruptions_per_person_per_day: float | None = None
     mttr_minutes: float | None = None
@@ -36,9 +36,9 @@ class RoiReport(BaseModel):
     month: str
     days: int
     headcount: int
-    episodes: int  # số lần cảnh báo xảy ra (mọi mức)
-    interruptions: int  # số lần thật sự gọi on-call
-    interruptions_now: float  # mỗi người mỗi ngày
+    episodes: int  # Total alert episodes across all severities
+    interruptions: int  # Incidents that actually paged on-call
+    interruptions_now: float  # Per responder per day
     interruptions_before: float | None
     interruptions_before_estimated: bool
     incidents_before: int | None
@@ -80,16 +80,23 @@ def compute_roi(store: Store, baseline: Baseline, month_start: datetime, now: da
     before = baseline.before.interruptions_per_person_per_day
     estimated = before is None
     if estimated and episodes:
-        # Chưa có số đo thật: giả định trước đây MỌI cảnh báo đều làm phiền người trực
+        # Unmeasured baseline: conservatively show what would happen if every episode interrupted on-call.
         before = episodes / head / days
 
     return RoiReport(
-        month=f"{start:%m/%Y}", days=days, headcount=head, episodes=episodes,
-        interruptions=len(incidents), interruptions_now=len(incidents) / head / days,
-        interruptions_before=before, interruptions_before_estimated=estimated,
+        month=f"{start:%m/%Y}",
+        days=days,
+        headcount=head,
+        episodes=episodes,
+        interruptions=len(incidents),
+        interruptions_now=len(incidents) / head / days,
+        interruptions_before=before,
+        interruptions_before_estimated=estimated,
         incidents_before=baseline.before.critical_incidents_per_month,
-        mttr_now=fmean(durations) if durations else None, mttr_before=baseline.before.mttr_minutes,
-        investigations=len(investigations), feedback_total=len(rated),
+        mttr_now=fmean(durations) if durations else None,
+        mttr_before=baseline.before.mttr_minutes,
+        investigations=len(investigations),
+        feedback_total=len(rated),
         feedback_up=sum(1 for r in rated if r.feedback == "up"),
         memory_hits=sum(1 for r in investigations if r.investigation.similar),
         minutes_per_correct=baseline.minutes_saved_per_correct_investigation,
@@ -108,37 +115,39 @@ def _change(before: float | None, now: float | None) -> str:
 
 def render_roi(r: RoiReport) -> str:
     star = "*" if r.interruptions_before_estimated and r.interruptions_before is not None else ""
-    accuracy = "—" if r.accuracy is None else f"{r.accuracy * 100:.0f}% ({r.feedback_up}/{r.feedback_total} có đánh giá)"
+    accuracy = "—" if r.accuracy is None else f"{r.accuracy * 100:.0f}% ({r.feedback_up}/{r.feedback_total} rated)"
     lines = [
-        f"# 📊 Báo cáo tháng {r.month}",
+        f"# 📊 Monthly ROI Report {r.month}",
         "",
-        f"> {r.episodes} lần cảnh báo xảy ra, chỉ {r.interruptions} lần phải gọi on-call. "
-        f"Tính trên {r.headcount} người trực trong {r.days} ngày.",
+        f"> {r.episodes} alert episodes occurred; only {r.interruptions} paged on-call. "
+        f"Calculated across {r.headcount} on-call responder(s) over {r.days} day(s).",
         "",
-        "| Chỉ số | Trước khi dùng | Tháng này | Thay đổi |",
+        "| Metric | Pre-adoption | This month | Change |",
         "| :--- | ---: | ---: | ---: |",
-        f"| Lần bị làm phiền / người / ngày | {_num(r.interruptions_before, star, 2)} | "
+        f"| Interruptions / responder / day | {_num(r.interruptions_before, star, 2)} | "
         f"{_num(r.interruptions_now, digits=2)} | {_change(r.interruptions_before, r.interruptions_now)} |",
-        f"| Sự cố phải gọi on-call | {_num(r.incidents_before, digits=0)} | {r.interruptions} | "
+        f"| On-call incidents | {_num(r.incidents_before, digits=0)} | {r.interruptions} | "
         f"{_change(r.incidents_before, r.interruptions)} |",
-        f"| MTTR trung bình | {_num(r.mttr_before, ' phút', 0)} | {_num(r.mttr_now, ' phút', 0)} | "
+        f"| Mean MTTR | {_num(r.mttr_before, ' min', 0)} | {_num(r.mttr_now, ' min', 0)} | "
         f"{_change(r.mttr_before, r.mttr_now)} |",
-        f"| Giả thuyết đúng (trong top 3) | — | {accuracy} | — |",
-        f"| Giờ điều tra tiết kiệm (ước tính) | — | {r.hours_saved:.1f} giờ | — |",
+        f"| Confirmed hypotheses (top 3) | — | {accuracy} | — |",
+        f"| Estimated investigation time saved | — | {r.hours_saved:.1f} hours | — |",
         "",
-        f"**Nổi bật:** {r.memory_hits}/{r.investigations} cuộc điều tra có gợi ý từ trí nhớ sự cố.",
+        f"**Highlight:** {r.memory_hits}/{r.investigations} investigations included similar-incident memory.",
         "",
-        "## Cách tính",
-        "- **Lần bị làm phiền:** số sự cố gọi on-call (🔴 và 🟡 leo thang) chia cho số người trực và số ngày.",
+        "## Methodology",
+        "- **Interruptions:** paged incidents (🔴 critical and escalated 🟡) divided by headcount and days.",
     ]
     if star:
-        lines.append("- **\\* Trước khi dùng (ước tính):** chưa có số đo thật, nên giả định trước đây mọi cảnh báo "
-                     "đều làm phiền người trực. Điền số đo thật vào `config/baseline.yaml` để chính xác hơn.")
+        lines.append(
+            "- **\\* Pre-adoption (estimated):** no measured baseline configured, assuming every alert episode "
+            "previously interrupted on-call. Set measured numbers in `config/baseline.yaml` for exact comparisons."
+        )
     lines += [
-        "- **MTTR:** trung bình thời gian từ lúc sự cố bắt đầu đến lúc hồi phục, chỉ tính sự cố đã đóng.",
-        "- **Giả thuyết đúng:** số cuộc điều tra được kỹ sư bấm ✅ chia cho số cuộc có đánh giá.",
-        f"- **Giờ tiết kiệm:** số cuộc điều tra được xác nhận đúng × {r.minutes_per_correct} phút. "
-        "Đây là ước tính thận trọng: chỉ tính các cuộc đã có người xác nhận.",
+        "- **MTTR:** mean duration from incident start to recovery across closed incidents.",
+        "- **Confirmed hypotheses:** investigations marked ✅ divided by all rated investigations.",
+        f"- **Time saved:** confirmed investigations × {r.minutes_per_correct} minutes. "
+        "Conservative estimate counting only human-confirmed investigations.",
         "",
     ]
     return "\n".join(lines)

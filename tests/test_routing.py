@@ -1,10 +1,10 @@
 from datetime import timedelta
 
-import pytest
 from pydantic import ValidationError
+import pytest
 
 from incidentlens.models import AlertRecord, Severity
-from incidentlens.routing.rules import Rule
+from incidentlens.routing.rules import EscalationPolicy, Router, RoutingConfig, Rule
 from incidentlens.testing import make_alert
 
 
@@ -38,16 +38,24 @@ def test_invalid_regex_rejected():
 
 
 def _record(clock, minutes_ago, **kw):
-    base = dict(fingerprint="x", name="DiskSpaceLow", service="db", severity=Severity.ACTION,
-                status="firing", summary="s", first_seen=clock.now - timedelta(minutes=minutes_ago),
-                last_seen=clock.now, receive_count=1)
+    base = dict(
+        fingerprint="x",
+        name="DiskSpaceLow",
+        service="db",
+        severity=Severity.ACTION,
+        status="firing",
+        summary="s",
+        first_seen=clock.now - timedelta(minutes=minutes_ago),
+        last_seen=clock.now,
+        receive_count=1,
+    )
     base.update(kw)
     return AlertRecord(**base)
 
 
 def test_escalation_after_max_pending(router, clock):
     assert router.escalation_reason(_record(clock, 239), clock.now) is None
-    assert "240 phút" in router.escalation_reason(_record(clock, 240), clock.now)
+    assert "240 minutes" in router.escalation_reason(_record(clock, 240), clock.now)
 
 
 def test_no_escalation_when_resolved_or_already_escalated(router, clock):
@@ -57,7 +65,6 @@ def test_no_escalation_when_resolved_or_already_escalated(router, clock):
 
 
 def test_escalation_after_too_many_repeats(clock):
-    from incidentlens.routing.rules import EscalationPolicy, Router, RoutingConfig
     router = Router(RoutingConfig(escalation=EscalationPolicy(max_pending_minutes=None, max_receive_count=5)))
     assert router.escalation_reason(_record(clock, 999, receive_count=4), clock.now) is None
-    assert "5 lần" in router.escalation_reason(_record(clock, 1, receive_count=5), clock.now)
+    assert "5 times" in router.escalation_reason(_record(clock, 1, receive_count=5), clock.now)

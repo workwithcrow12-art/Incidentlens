@@ -1,14 +1,15 @@
-"""Che dữ liệu nhạy cảm trước khi đưa log vào bằng chứng hoặc gửi cho LLM."""
+"""Redact sensitive values before including logs in evidence or sending text to an LLM."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import re
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$")
 
 
 def is_safe_name(name: str) -> bool:
-    """Tên dịch vụ đủ an toàn để chèn vào câu truy vấn hoặc lệnh (chống injection qua label)."""
+    """Validate that a service name is safe to interpolate into queries or command arguments."""
     return bool(SAFE_NAME.fullmatch(name))
 
 
@@ -24,16 +25,28 @@ def _luhn(digits: str) -> bool:
     return total % 10 == 0
 
 
-def _card(match: re.Match) -> str:
+def _card(match: re.Match[str]) -> str:
     digits = re.sub(r"\D", "", match.group(0))
     return "[CARD]" if 13 <= len(digits) <= 19 and _luhn(digits) else match.group(0)
 
 
-_RULES: list[tuple[re.Pattern, object]] = [
+Replacement = str | Callable[[re.Match[str]], str]
+
+_RULES: list[tuple[re.Pattern[str], Replacement]] = [
     (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"), "[JWT]"),
+    (re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:)([^@\s/]+)(@)"), r"\1[REDACTED]\3"),
+    (re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})\b"), "[GITHUB_TOKEN]"),
+    (re.compile(r"(?<![A-Za-z0-9])xox(?:e\.)?[baprs]-[A-Za-z0-9-]{6,}\b"), "[SLACK_TOKEN]"),
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [TOKEN]"),
-    (re.compile(r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization)\b"
-                r"(\"?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"), r"\1\2[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_/])"
+            r"([A-Za-z0-9_-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|"
+            r"private[_-]?key|client[_-]?key|auth[_-]?key|authorization)[A-Za-z0-9_-]*)"
+            r"([\"']?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"
+        ),
+        r"\1\2[REDACTED]",
+    ),
     (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "[AWS_KEY]"),
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[EMAIL]"),
     (re.compile(r"(?<![\w.])\d(?:[ -]?\d){12,18}(?![\w.])"), _card),

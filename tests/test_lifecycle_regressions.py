@@ -3,6 +3,8 @@ from datetime import timedelta
 
 from conftest import START
 from incidentlens.investigation.base import NoopInvestigator
+from incidentlens.outputs.pagerduty import PagerDutyPager
+from incidentlens.outputs.slack import SlackNotifier
 from incidentlens.testing import make_alert, simulated_service
 
 
@@ -68,9 +70,9 @@ async def test_recovery_during_digest_remains_pending(lens, clock):
     await lens.handle_alerts([alert.model_copy(update={"status": "resolved", "ends_at": clock.now})])
     release.set()
     first = await running
-    assert "đang xảy ra" in first.read_text(encoding="utf-8")
+    assert "ongoing" in first.read_text(encoding="utf-8")
     recovery = await lens.run_digest()
-    assert recovery is not None and "đã hồi phục" in recovery.read_text(encoding="utf-8")
+    assert recovery is not None and "resolved" in recovery.read_text(encoding="utf-8")
     assert await lens.run_digest() is None
     await lens.drain()
 
@@ -136,7 +138,7 @@ async def test_resolution_cancels_failed_trigger(lens, clock, world):
     await lens.check_escalations()
     await lens.drain()
     assert [p["event_action"] for p in world.pages] == ["resolve"]
-    assert len(world.slack) == 1 and "Đã hồi phục" in world.slack[0]["text"]
+    assert len(world.slack) == 1 and "Resolved:" in world.slack[0]["text"]
 
 
 async def test_concurrent_resolution_leaves_closed_incident(lens, clock):
@@ -159,8 +161,9 @@ async def test_concurrent_resolution_leaves_closed_incident(lens, clock):
     alert = make_alert(starts_at=START)
     firing = asyncio.create_task(lens.handle_alerts([alert]))
     await asyncio.wait_for(entered.wait(), 2)
-    recovery = asyncio.create_task(lens.handle_alerts([
-        alert.model_copy(update={"status": "resolved", "ends_at": clock.now})]))
+    recovery = asyncio.create_task(
+        lens.handle_alerts([alert.model_copy(update={"status": "resolved", "ends_at": clock.now})])
+    )
     await asyncio.sleep(0)
     release.set()
     await asyncio.gather(firing, recovery)
@@ -201,7 +204,54 @@ async def test_digested_warning_publishes_recovery_once(lens, clock):
     recovered = alert.model_copy(update={"status": "resolved", "ends_at": clock.now})
     await lens.handle_alerts([recovered])
     path = await lens.run_digest()
-    assert path is not None and "đã hồi phục" in path.read_text(encoding="utf-8")
+    assert path is not None and "resolved" in path.read_text(encoding="utf-8")
     await lens.handle_alerts([recovered])
     assert await lens.run_digest() is None
     await lens.drain()
+
+
+async def test_unconfigured_pagerduty_is_not_treated_as_failure_or_queued(lens, clock, world):
+    lens.investigator = NoopInvestigator()
+    lens.pager = PagerDutyPager(None, world.client())
+
+    alert = make_alert(starts_at=START)
+    await lens.handle_alerts([alert])
+    await lens.drain()
+
+    assert world.pages == []
+    assert len(world.slack) == 1
+    assert "<!channel>" not in world.slack[0]["text"]
+    assert lens.store.pending_deliveries() == []
+
+    clock.now += timedelta(minutes=1)
+    await lens.check_escalations()
+    assert len(world.slack) == 1
+    assert lens.store.pending_deliveries() == []
+
+    clock.now += timedelta(minutes=10)
+    await lens.handle_alerts([alert.model_copy(update={"status": "resolved", "ends_at": clock.now})])
+    await lens.drain()
+    assert len(world.slack) == 2
+    assert lens.store.pending_deliveries() == []
+
+
+async def test_unconfigured_slack_and_pagerduty_escalation_and_resolution_leave_no_queue(lens, clock, world):
+    lens.investigator = NoopInvestigator()
+    lens.pager = PagerDutyPager(None, world.client())
+    lens.notifier = SlackNotifier(world.client())
+
+    warn = make_alert(name="DiskSpaceLow", service="db-replica-02", severity="warning", starts_at=START)
+    await lens.handle_alerts([warn])
+    clock.now += timedelta(hours=5)
+    assert await lens.check_escalations() == ["db-replica-02-DiskSpaceLow"]
+    assert lens.store.pending_deliveries() == []
+
+    postmortem = lens.archive.root / "postmortems" / "INC-0001.md"
+    postmortem.parent.mkdir(parents=True, exist_ok=True)
+    postmortem.write_text("Custom edited postmortem", encoding="utf-8")
+
+    clock.now += timedelta(minutes=10)
+    await lens.handle_alerts([warn.model_copy(update={"status": "resolved", "ends_at": clock.now})])
+    await lens.drain()
+    assert lens.store.pending_deliveries() == []
+    assert postmortem.read_text(encoding="utf-8") == "Custom edited postmortem"

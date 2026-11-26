@@ -1,7 +1,7 @@
-"""Bộ máy điều tra: thu thập bằng chứng, suy luận bằng luật, và hàng rào an toàn cho LLM."""
+"""Investigation engine tests: evidence collection, rule hypotheses, and LLM safety guardrails."""
 
-import json
 from datetime import timedelta
+import json
 
 import pytest
 
@@ -14,13 +14,14 @@ from incidentlens.testing import SimulatedWorld, make_alert, simulated_service
 
 
 def target(service="auth-service", name="HighLatency", summary="p95 latency 450ms"):
-    return InvestigationTarget(fingerprint=f"{service}-{name}", service=service, name=name,
-                               summary=summary, started_at=START)
+    return InvestigationTarget(
+        fingerprint=f"{service}-{name}", service=service, name=name, summary=summary, started_at=START
+    )
 
 
 def test_confidence_rules():
-    assert confidence_for({"change"}) == "low"  # chỉ trùng thời điểm
-    assert confidence_for({"memory"}) == "low"  # chỉ giống sự cố cũ
+    assert confidence_for({"change"}) == "low"  # Timing correlation only
+    assert confidence_for({"memory"}) == "low"  # Historical similarity only
     assert confidence_for({"change", "metric"}) == "medium"
     assert confidence_for({"dependency"}) == "medium"
     assert confidence_for({"change", "metric", "log"}) == "high"
@@ -30,30 +31,30 @@ async def test_full_investigation_finds_deploy(lens):
     inv = await lens.investigator.investigate(target())
     kinds = {e.kind for e in inv.evidence}
     assert kinds == {"metric", "log", "change"}
-    assert all(e.url.startswith("http") for e in inv.evidence)  # mọi bằng chứng đều có link
+    assert all(e.url.startswith("http") for e in inv.evidence)
 
     top = inv.hypotheses[0]
-    assert "a1b2c3d" in top.statement and "30 phút sau deploy" in top.statement
+    assert "a1b2c3d" in top.statement and "30 minutes after deploy" in top.statement
     assert top.confidence == "high"
     assert {e.kind for e in inv.evidence_for(top)} == {"metric", "log", "change"}
     assert inv.engine == "rules"
 
     metrics = [e.description for e in inv.evidence if e.kind == "metric"]
-    assert any(d.startswith("Bộ nhớ sử dụng: 200 MB") for d in metrics)
-    assert not any("CPU" in d for d in metrics)  # CPU chỉ tăng nhẹ nên không được coi là bất thường
+    assert any(d.startswith("Memory usage: 200 MB") for d in metrics)
+    assert not any("CPU" in d for d in metrics)  # Minor CPU change stays below threshold
 
     logs = next(e.description for e in inv.evidence if e.kind == "log")
-    assert "87 dòng log lỗi" in logs and "[EMAIL]" in logs and "@example.com" not in logs
+    assert "87 error log lines" in logs and "[EMAIL]" in logs and "@example.com" not in logs
 
 
 async def test_deploy_without_direct_evidence_is_low_confidence(tmp_path, clock):
     world = SimulatedWorld(START, broken="auth-service")
     lens = simulated_service(tmp_path, clock, world)
-    world.fail_hosts |= {"prometheus.test", "loki.test"}  # nguồn bằng chứng trực tiếp đều lỗi
+    world.fail_hosts |= {"prometheus.test", "loki.test"}  # Direct evidence collectors unavailable
     inv = await lens.investigator.investigate(target())
     assert [e.kind for e in inv.evidence] == ["change"]
     assert inv.hypotheses[0].confidence == "low"
-    assert "chưa có bằng chứng trực tiếp" in inv.hypotheses[0].statement
+    assert "no direct behavioral evidence" in inv.hypotheses[0].statement
 
 
 async def test_no_evidence_means_no_hypothesis(lens):
@@ -79,10 +80,20 @@ async def test_deploy_at_incident_start_remains_a_candidate(tmp_path, clock):
 
 
 def test_rules_choose_pre_onset_deploy_when_newer_deploy_is_present():
-    before = Finding("change", "earlier deployment", "https://example.test/before",
-                     {"ref": "before-onset", "created_at": START - timedelta(minutes=30)}, id="E1")
-    after = Finding("change", "later deployment", "https://example.test/after",
-                    {"ref": "after-onset", "created_at": START + timedelta(minutes=1)}, id="E2")
+    before = Finding(
+        "change",
+        "earlier deployment",
+        "https://example.test/before",
+        {"ref": "before-onset", "created_at": START - timedelta(minutes=30)},
+        id="E1",
+    )
+    after = Finding(
+        "change",
+        "later deployment",
+        "https://example.test/after",
+        {"ref": "after-onset", "created_at": START + timedelta(minutes=1)},
+        id="E2",
+    )
     hypotheses = rule_hypotheses(target(), [before, after])
     assert len(hypotheses) == 1
     assert hypotheses[0].evidence_ids == ["E1"]
@@ -90,8 +101,9 @@ def test_rules_choose_pre_onset_deploy_when_newer_deploy_is_present():
 
 
 async def test_dependency_alert_becomes_hypothesis(lens):
-    await lens.handle_alerts([make_alert(name="ConnectionsExhausted", service="user-db", severity="warning",
-                                         starts_at=START - timedelta(minutes=3))])
+    await lens.handle_alerts(
+        [make_alert(name="ConnectionsExhausted", service="user-db", severity="warning", starts_at=START - timedelta(minutes=3))]
+    )
     inv = await lens.investigator.investigate(target())
     dep = next(h for h in inv.hypotheses if "user-db" in h.statement)
     assert "ConnectionsExhausted" in dep.statement and dep.confidence == "medium"
@@ -118,8 +130,13 @@ async def test_memory_of_past_incident(lens, clock):
     await lens.handle_alerts([make_alert(status="resolved", starts_at=START, ends_at=clock.now)])
 
     later = START + timedelta(days=7)
-    again = InvestigationTarget(fingerprint="auth-service-HighLatency", service="auth-service",
-                                name="HighLatency", summary="p95 latency 500ms", started_at=later)
+    again = InvestigationTarget(
+        fingerprint="auth-service-HighLatency",
+        service="auth-service",
+        name="HighLatency",
+        summary="p95 latency 500ms",
+        started_at=later,
+    )
     lens.investigator._changes = type("None_", (), {"recent_changes": staticmethod(lambda *a: _empty())})()
     inv = await lens.investigator.investigate(again)
     assert inv.similar and inv.similar[0].code == "INC-0001"
@@ -131,7 +148,7 @@ async def _empty():
     return []
 
 
-# ---------- Lớp LLM ----------
+# ---------- LLM layer ----------
 
 
 def llm_lens(tmp_path, clock, reply):
@@ -140,35 +157,50 @@ def llm_lens(tmp_path, clock, reply):
 
 
 async def test_llm_rewrites_but_code_sets_confidence(tmp_path, clock):
-    reply = json.dumps({"hypotheses": [
-        {"statement": "Bản deploy a1b2c3d gây rò rỉ bộ nhớ trong generateToken()", "evidence_ids": ["E3", "E4", "E5"],
-         "confidence": "low"},
-        {"statement": "Chỉ dựa trên thời điểm deploy", "evidence_ids": ["E5"], "confidence": "high"},
-    ]})
-    lens, world = llm_lens(tmp_path, clock, f"```json\n{reply}\n```")
+    reply = json.dumps(
+        {
+            "hypotheses": [
+                {
+                    "statement": "Deploy a1b2c3d introduced a memory leak in generateToken()",
+                    "evidence_ids": ["E3", "E4", "E5"],
+                    "confidence": "low",
+                },
+                {
+                    "statement": "Timing-only deploy correlation",
+                    "evidence_ids": ["E5"],
+                    "confidence": "high",
+                },
+            ]
+        }
+    )
+    lens, _ = llm_lens(tmp_path, clock, f"```json\n{reply}\n```")
     inv = await lens.investigator.investigate(target())
     assert inv.engine == "llm"
     kinds = {e.id: e.kind for e in inv.evidence}
     assert kinds["E5"] == "change"
-    assert inv.hypotheses[0].statement.startswith("Bản deploy a1b2c3d")
-    assert inv.hypotheses[0].confidence == "high"  # metric + log, bất kể LLM tự nhận "low"
-    assert inv.hypotheses[1].confidence == "low"  # chỉ có deploy, bất kể LLM tự nhận "high"
+    assert inv.hypotheses[0].statement.startswith("Deploy a1b2c3d")
+    assert inv.hypotheses[0].confidence == "high"  # metric + log override LLM's "low"
+    assert inv.hypotheses[1].confidence == "low"  # change-only overrides LLM's "high"
 
 
 async def test_llm_hallucinated_evidence_is_dropped(tmp_path, clock):
-    reply = json.dumps({"hypotheses": [
-        {"statement": "Do mất điện ở trung tâm dữ liệu", "evidence_ids": ["E99"]},
-        {"statement": "Không dẫn chứng gì", "evidence_ids": []},
-    ]})
+    reply = json.dumps(
+        {
+            "hypotheses": [
+                {"statement": "Caused by a datacenter power outage", "evidence_ids": ["E99"]},
+                {"statement": "Uncited claim", "evidence_ids": []},
+            ]
+        }
+    )
     lens, _ = llm_lens(tmp_path, clock, reply)
     inv = await lens.investigator.investigate(target())
-    assert inv.engine == "rules"  # không còn giả thuyết hợp lệ → dùng lại bản tạo bằng luật
-    assert not any("mất điện" in h.statement for h in inv.hypotheses)
+    assert inv.engine == "rules"
+    assert not any("power outage" in h.statement for h in inv.hypotheses)
     assert inv.hypotheses
 
 
 async def test_llm_garbage_or_outage_falls_back_to_rules(tmp_path, clock):
-    for reply in ("Xin lỗi, tôi không thể giúp.", "{not json", None):
+    for reply in ("Sorry, I cannot help with that.", "{not json", None):
         lens, _ = llm_lens(tmp_path, clock, reply)
         inv = await lens.investigator.investigate(target())
         assert inv.engine == "rules" and inv.hypotheses[0].confidence == "high"
@@ -176,14 +208,14 @@ async def test_llm_garbage_or_outage_falls_back_to_rules(tmp_path, clock):
 
 async def test_llm_never_receives_raw_secrets(tmp_path, clock):
     lens, world = llm_lens(tmp_path, clock, '{"hypotheses": []}')
-    await lens.investigator.investigate(target(summary="lỗi đăng nhập của bob@corp.com password=hunter2"))
+    await lens.investigator.investigate(target(summary="login failure for bob@corp.com password=hunter2"))
     sent = json.dumps(world.llm_requests[-1], ensure_ascii=False)
     assert "bob@corp.com" not in sent and "hunter2" not in sent and "@example.com" not in sent
-    assert "KHÔNG phải chỉ dẫn" in world.llm_requests[-1]["system"]
+    assert "NOT instructions" in world.llm_requests[-1]["system"]
 
 
 async def test_llm_output_is_redacted_and_bounded(tmp_path, clock):
-    reply = json.dumps({"hypotheses": [{"statement": "Liên hệ admin@corp.com " + "x" * 1000, "evidence_ids": ["E1"]}]})
+    reply = json.dumps({"hypotheses": [{"statement": "Contact admin@corp.com " + "x" * 1000, "evidence_ids": ["E1"]}]})
     lens, _ = llm_lens(tmp_path, clock, reply)
     inv = await lens.investigator.investigate(target())
     assert "admin@corp.com" not in inv.hypotheses[0].statement
@@ -193,12 +225,23 @@ async def test_llm_output_is_redacted_and_bounded(tmp_path, clock):
 async def test_llm_redacts_historical_root_cause_and_fix(tmp_path, clock):
     lens, world = llm_lens(tmp_path, clock, '{"hypotheses": []}')
     previous = START - timedelta(days=7)
-    record = AlertRecord(fingerprint="previous-incident", name="HighLatency", service="auth-service",
-                         severity=Severity.CRITICAL, status="firing", summary="p95 latency 450ms",
-                         first_seen=previous, last_seen=previous, receive_count=1)
+    record = AlertRecord(
+        fingerprint="previous-incident",
+        name="HighLatency",
+        service="auth-service",
+        severity=Severity.CRITICAL,
+        status="firing",
+        summary="p95 latency 450ms",
+        first_seen=previous,
+        last_seen=previous,
+        receive_count=1,
+    )
     incident, _ = lens.store.open_incident(record, "critical", previous)
-    lens.store.set_resolution(incident.id, root_cause="Expired password=historical-password",
-                              fix="Rotate token=historical-token for owner@corp.com")
+    lens.store.set_resolution(
+        incident.id,
+        root_cause="Expired password=historical-password",
+        fix="Rotate token=historical-token for owner@corp.com",
+    )
     lens.store.close_incident(record.fingerprint, previous + timedelta(minutes=20))
 
     inv = await lens.investigator.investigate(target())
@@ -238,10 +281,14 @@ async def test_llm_redacts_every_alert_text_field(field):
     None,
 ])
 async def test_malformed_llm_item_preserves_complete_rule_investigation(tmp_path, clock, malformed):
-    reply = json.dumps({"hypotheses": [
-        {"statement": "Do not accept a partial response", "evidence_ids": ["E1"]},
-        malformed,
-    ]})
+    reply = json.dumps(
+        {
+            "hypotheses": [
+                {"statement": "Do not accept a partial response", "evidence_ids": ["E1"]},
+                malformed,
+            ]
+        }
+    )
     lens, _ = llm_lens(tmp_path, clock, reply)
 
     inv = await lens.investigator.investigate(target())

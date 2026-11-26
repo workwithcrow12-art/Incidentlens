@@ -118,19 +118,26 @@ async def test_signed_retry_is_deduplicated_after_store_reopens(action_service):
 
 
 @pytest.mark.parametrize("change", ["body", "timestamp"])
-async def test_fresh_signed_action_can_repeat_the_same_command(action_service, change):
+async def test_fresh_signed_action_respects_cooldown_then_can_repeat(action_service, clock, change):
+    from datetime import timedelta
+
     build, executed = action_service
     lens = build()
     timestamp = str(int(time.time()))
     first = signed_action(timestamp=timestamp)
-    second = (signed_action(action_ts="12345.002", timestamp=timestamp) if change == "body"
-              else signed_action(timestamp=str(int(timestamp) + 1)))
+    during_cooldown = (signed_action(action_ts="12345.002", timestamp=timestamp) if change == "body"
+                       else signed_action(timestamp=str(int(timestamp) + 1)))
+    after_cooldown = (signed_action(action_ts="12345.003", timestamp=timestamp) if change == "body"
+                      else signed_action(timestamp=str(int(timestamp) + 2)))
     async with slack_client(lens) as client:
         assert (await client.post("/slack/interactions", **first)).status_code == 200
-        assert (await client.post("/slack/interactions", **second)).status_code == 200
+        assert (await client.post("/slack/interactions", **during_cooldown)).status_code == 200
+        assert executed == [["restart-test", "auth-service"]]
+        clock.now += timedelta(minutes=6)
+        assert (await client.post("/slack/interactions", **after_cooldown)).status_code == 200
 
     assert executed == [["restart-test", "auth-service"], ["restart-test", "auth-service"]]
-    assert len(lens.store.actions_for_incident(1)) == 2
+    assert [row.status for row in lens.store.actions_for_incident(1)] == ["executed", "denied", "executed"]
 
 
 async def test_invalid_signature_does_not_consume_a_valid_request(action_service):

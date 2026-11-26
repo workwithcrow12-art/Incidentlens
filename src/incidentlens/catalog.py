@@ -1,4 +1,4 @@
-"""Danh mục dịch vụ: đội phụ trách, repo mã nguồn, dịch vụ phụ thuộc, runbook."""
+"""Service catalog: owning team, source repository, upstream dependencies, and runbook link."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 
 class ServiceInfo(BaseModel):
-    team: str = "Chưa có người phụ trách"
+    team: str = "Unassigned"
     repo: str | None = None
     depends_on: list[str] = Field(default_factory=list)
     runbook: str | None = None

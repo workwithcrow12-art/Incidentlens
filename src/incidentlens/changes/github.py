@@ -1,4 +1,4 @@
-"""Liên kết thay đổi: lấy các deploy gần đây từ GitHub Deployments API."""
+"""Change correlation: fetch recent deployments from the GitHub Deployments API."""
 
 from __future__ import annotations
 
@@ -43,11 +43,11 @@ class GitHubChangeProvider:
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:
-            # Thiếu thông tin thay đổi không được làm hỏng digest
-            log.warning("Không lấy được deploy của %s: %s", repo, exc)
+            # Missing deployment data must never break a digest or investigation.
+            log.warning("Failed to fetch deployments for %s: %s", repo, exc)
             return []
 
-        changes = []
+        changes: list[Change] = []
         for d in resp.json():
             created = datetime.fromisoformat(d["created_at"].replace("Z", "+00:00"))
             if created < since:

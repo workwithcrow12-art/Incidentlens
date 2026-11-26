@@ -1,8 +1,8 @@
-# Luật định tuyến cảnh báo — do CON NGƯỜI viết và duyệt, AI không được sửa.
-# Luật được xét từ trên xuống, luật đầu tiên khớp sẽ quyết định mức.
-#   match:    so khớp chính xác theo label
-#   match_re: so khớp regex (toàn bộ giá trị) theo label
-# Mức: critical (🔴 gọi ngay) · action (🟡 vào digest) · info (⚪ chỉ ghi lại)
+# Alert routing rules — authored and reviewed by humans; never modified by an LLM.
+# Evaluated top to bottom; the first matching rule determines severity.
+#   match:    exact label match
+#   match_re: full-value regex label match
+# Severities: critical (🔴 page immediately) · action (🟡 include in digest) · info (⚪ record only)
 
 default_severity: info
 
@@ -27,7 +27,7 @@ rules:
     match: { severity: info }
     severity: info
 
-# Luật leo thang: 🟡 tự động nâng lên 🔴 và gọi on-call khi
+# Escalation policy: 🟡 action alerts automatically promote to 🔴 and page on-call when:
 escalation:
-  max_pending_minutes: 240   # vẫn đang xảy ra sau ngần này phút
-  max_receive_count: null    # hoặc nhận lặp lại quá N lần (null = tắt)
+  max_pending_minutes: 240   # still firing after this many minutes
+  max_receive_count: null    # or received at least N times (null = disabled)

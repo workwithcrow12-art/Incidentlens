@@ -1,7 +1,9 @@
 [project]
 name = "incidentlens"
 version = "1.0.0"
-description = "AI điều tra sự cố: định tuyến cảnh báo, điều tra tự động, trí nhớ sự cố, hành động có người duyệt, báo cáo ROI"
+description = "Rule-based alert routing, evidence-backed incident investigation, incident memory, human-approved actions, and ROI reporting"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110",
@@ -15,7 +17,13 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-cov>=5"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "mypy>=1.10",
+    "types-PyYAML>=6.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -25,10 +33,29 @@ build-backend = "hatchling.build"
 packages = ["src/incidentlens"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/config", "/examples", "/scripts", "/docs", "/README.md", "/pyproject.toml", "/Dockerfile", "/docker-compose.yml", "/.env.example", "/.dockerignore"]
+include = [
+    "/src",
+    "/tests",
+    "/config",
+    "/examples",
+    "/scripts",
+    "/docs",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/Dockerfile",
+    "/docker-compose.yml",
+    "/.env.example",
+    "/.dockerignore",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_configs = true

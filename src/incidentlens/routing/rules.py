@@ -1,7 +1,6 @@
-"""Bộ định tuyến luật: xếp cảnh báo vào 🔴 / 🟡 / ⚪ và quyết định leo thang.
+"""Rule-based alert router: classifies alerts into critical / action / info and checks escalations.
 
-Đây là đường đi của cảnh báo khẩn cấp nên KHÔNG dùng AI: phải nhanh, đoán trước được
-và chỉ do con người cấu hình.
+Critical paging never depends on an LLM: routing must remain fast, deterministic, and human-authored.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ class Rule(BaseModel):
             try:
                 re.compile(pattern)
             except re.error as exc:
-                raise ValueError(f"Regex không hợp lệ cho label '{key}': {exc}") from exc
+                raise ValueError(f"Invalid regex for label '{key}': {exc}") from exc
         return value
 
     def matches(self, labels: dict[str, str]) -> bool:
@@ -65,14 +64,14 @@ class Router:
         return RoutedAlert(alert=alert, severity=self.config.default_severity, rule="default")
 
     def escalation_reason(self, record: AlertRecord, now: datetime) -> str | None:
-        """Trả về lý do nếu cảnh báo 🟡 cần nâng lên 🔴, ngược lại trả về None."""
+        """Return an escalation reason when an action alert must be promoted to critical, else None."""
         if record.severity is not Severity.ACTION or record.status != "firing" or record.escalated:
             return None
         policy = self.config.escalation
         if policy.max_pending_minutes is not None:
             age = now - record.first_seen
             if age >= timedelta(minutes=policy.max_pending_minutes):
-                return f"vẫn chưa hồi phục sau {int(age.total_seconds() // 60)} phút"
+                return f"still firing after {int(age.total_seconds() // 60)} minutes"
         if policy.max_receive_count is not None and record.receive_count >= policy.max_receive_count:
-            return f"đã lặp lại {record.receive_count} lần"
+            return f"repeated {record.receive_count} times"
         return None

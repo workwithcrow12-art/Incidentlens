@@ -1,22 +1,24 @@
-# Danh sách hành động ĐƯỢC PHÉP chạy từ nút bấm trên Slack.
-# - Chỉ người có Slack user ID trong `approvers` mới bấm được. Để rỗng = không ai được phép.
-# - Lệnh là danh sách tham số (không qua shell). {service} được thay bằng tên dịch vụ.
-# - Mặc định IL_ACTIONS_ENABLED=false: chỉ hiển thị lệnh SẼ chạy, không chạy thật.
-# - Máy chạy IncidentLens cần có kubectl và quyền RBAC giới hạn đúng các lệnh dưới đây.
+# Allowlist of remediation actions invokable from verified Slack buttons.
+# - Only Slack user IDs listed in `approvers` are authorized; an empty list denies everyone.
+# - Commands execute as argument lists without a shell. {service} is replaced after safe-name validation.
+# - Disabled by default (IL_ACTIONS_ENABLED=false): previews the command without executing it.
+# - Grant the IncidentLens host minimal RBAC scoped strictly to the allowlisted commands below.
 
 actions:
   rollback:
     label: "🔄 Rollback"
     command: ["kubectl", "rollout", "undo", "deployment/{service}", "-n", "production"]
     services: ["auth-service", "payment-worker"]
-    approvers: []          # ví dụ: ["U012ABCDEF", "U034GHIJKL"]
-    confirm: "Rollback `{service}` về phiên bản trước? Nếu cần phân tích nguyên nhân, hãy lấy memory dump TRƯỚC khi rollback."
+    approvers: []          # example: ["U012ABCDEF", "U034GHIJKL"]
+    confirm: "Roll back `{service}` to the previous revision? Capture a memory dump first if root-cause forensics are needed."
     timeout_seconds: 120
+    cooldown_seconds: 300
 
   restart:
     label: "♻️ Restart"
     command: ["kubectl", "rollout", "restart", "deployment/{service}", "-n", "production"]
     services: ["*"]
     approvers: []
-    confirm: "Restart toàn bộ pod của `{service}`? Trạng thái trong bộ nhớ sẽ mất."
+    confirm: "Restart all pods of `{service}`? In-memory state will be lost."
     timeout_seconds: 120
+    cooldown_seconds: 300

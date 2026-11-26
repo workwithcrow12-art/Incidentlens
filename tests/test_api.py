@@ -1,18 +1,23 @@
+import asyncio
+from datetime import timedelta
 import hashlib
 import hmac
 import json
-import time
-from datetime import timedelta
 from pathlib import Path
+import time
 from urllib.parse import urlencode
 
-import pytest
 from fastapi.testclient import TestClient
+import pytest
 
+from conftest import START
 from incidentlens.app import build_synthesizer, create_app
 from incidentlens.config import Settings
+from incidentlens.testing import make_alert
 
-SAMPLE = json.loads((Path(__file__).resolve().parents[1] / "examples" / "alertmanager_payload.json").read_text(encoding="utf-8"))
+SAMPLE = json.loads(
+    (Path(__file__).resolve().parents[1] / "examples" / "alertmanager_payload.json").read_text(encoding="utf-8")
+)
 SECRET = "slack-signing-secret"
 
 
@@ -21,14 +26,23 @@ def client(lens, **kw):
 
 
 def slack_post(c, action_id, value, user="U1", secret=SECRET, ts=None):
-    payload = {"type": "block_actions", "user": {"id": user, "username": "alice"},
-               "actions": [{"action_id": action_id, "value": value}]}
+    payload = {
+        "type": "block_actions",
+        "user": {"id": user, "username": "alice"},
+        "actions": [{"action_id": action_id, "value": value}],
+    }
     body = urlencode({"payload": json.dumps(payload)}).encode()
     ts = ts or str(int(time.time()))
     sig = "v0=" + hmac.new(secret.encode(), b"v0:" + ts.encode() + b":" + body, hashlib.sha256).hexdigest()
-    return c.post("/slack/interactions", content=body, headers={
-        "content-type": "application/x-www-form-urlencoded",
-        "x-slack-request-timestamp": ts, "x-slack-signature": sig})
+    return c.post(
+        "/slack/interactions",
+        content=body,
+        headers={
+            "content-type": "application/x-www-form-urlencoded",
+            "x-slack-request-timestamp": ts,
+            "x-slack-signature": sig,
+        },
+    )
 
 
 def test_webhook_incident_and_lookup(lens, world, clock):
@@ -36,7 +50,7 @@ def test_webhook_incident_and_lookup(lens, world, clock):
         assert c.get("/healthz").json() == {"status": "ok"}
         resp = c.post("/webhooks/alertmanager", json=SAMPLE)
         assert resp.json() == {"received": 3, "critical": 1, "action": 1, "info": 1}
-    # Thoát khỏi `with` = tắt ứng dụng: các cuộc điều tra đang chạy được chờ hoàn tất
+    # Exiting `with` runs shutdown lifespan, draining in-flight investigations.
     assert len(world.pages) == 1
 
     with client(lens) as c:
@@ -51,7 +65,7 @@ def test_webhook_incident_and_lookup(lens, world, clock):
         path = c.post("/digest/run").json()["path"]
         assert Path(path).exists()
         assert c.post("/escalations/check").json() == {"escalated": []}
-        clock.now += timedelta(hours=5)  # cảnh báo 🟡 vẫn chưa hồi phục sau 5 giờ
+        clock.now += timedelta(hours=5)  # 🟡 warning remains unresolved after 5 hours
         assert c.post("/escalations/check").json() == {"escalated": ["a1b2c3d4e5f60002"]}
         assert c.post("/maintenance/run").json()["purged"] == {"alerts": 0, "episodes": 0}
 
@@ -64,25 +78,31 @@ def test_feedback_resolution_postmortem_and_roi(lens):
         assert c.post("/investigations/77/feedback", json={"choice": 1, "user": "a"}).status_code == 404
         assert c.post("/investigations/1/feedback", json={"choice": 0, "user": "alice"}).status_code == 200
 
-        body = {"root_cause": "generateToken() không giải phóng bộ nhớ", "fix": "rollback về v2.3.1"}
-        assert c.post("/incidents/1/resolution", json=body).json()["fix"] == "rollback về v2.3.1"
+        body = {"root_cause": "generateToken() leaked buffers", "fix": "roll back to v2.3.1"}
+        assert c.post("/incidents/1/resolution", json=body).json()["fix"] == "roll back to v2.3.1"
         assert c.post("/incidents/9/resolution", json=body).status_code == 404
 
         post = c.get("/incidents/1/postmortem")
         assert post.headers["content-type"].startswith("text/markdown")
-        assert "generateToken() không giải phóng bộ nhớ" in post.text and "rollback về v2.3.1" in post.text
+        assert "generateToken() leaked buffers" in post.text and "roll back to v2.3.1" in post.text
         assert c.get("/incidents/9/postmortem").status_code == 404
 
         roi = c.post("/reports/roi", params={"month": "2026-11"}).json()
-        assert roi["markdown"].startswith("# 📊 Báo cáo tháng 11/2026") and Path(roi["path"]).exists()
-        assert c.post("/reports/roi", params={"month": "thang-11"}).status_code == 422
+        assert roi["markdown"].startswith("# 📊 Monthly ROI Report 11/2026") and Path(roi["path"]).exists()
+        assert c.post("/reports/roi", params={"month": "nov-2026"}).status_code == 422
 
 
 def test_token_protects_every_endpoint(lens):
     with client(lens, webhook_token="secret") as c:
-        for method, url in [("post", "/webhooks/alertmanager"), ("post", "/digest/run"), ("get", "/incidents"),
-                            ("get", "/incidents/1/postmortem"), ("post", "/reports/roi"),
-                            ("post", "/incidents/1/resolution"), ("post", "/investigations/1/feedback")]:
+        for method, url in [
+            ("post", "/webhooks/alertmanager"),
+            ("post", "/digest/run"),
+            ("get", "/incidents"),
+            ("get", "/incidents/1/postmortem"),
+            ("post", "/reports/roi"),
+            ("post", "/incidents/1/resolution"),
+            ("post", "/investigations/1/feedback"),
+        ]:
             assert getattr(c, method)(url).status_code == 401, url
         ok = c.post("/webhooks/alertmanager", json=SAMPLE, headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200
@@ -92,18 +112,18 @@ def test_token_protects_every_endpoint(lens):
 def test_slack_buttons_require_valid_signature(lens, world):
     with client(lens) as c:
         c.post("/webhooks/alertmanager", json=SAMPLE)
-        assert slack_post(c, "fb_1", "1:1").status_code == 503  # chưa cấu hình khóa ký
+        assert slack_post(c, "fb_1", "1:1").status_code == 503  # signing secret not configured
 
     with client(lens, slack_signing_secret=SECRET) as c:
         assert slack_post(c, "fb_1", "1:1", secret="wrong").status_code == 401
-        assert slack_post(c, "fb_1", "1:1", ts=str(int(time.time()) - 3600)).status_code == 401  # phát lại
-        assert c.post("/slack/interactions", content=b"payload=x").status_code == 401  # không có chữ ký
+        assert slack_post(c, "fb_1", "1:1", ts=str(int(time.time()) - 3600)).status_code == 401  # replay expired
+        assert c.post("/slack/interactions", content=b"payload=x").status_code == 401  # missing signature
         assert lens.store.get_investigation(1).feedback is None
 
         assert slack_post(c, "fb_1", "1:1").status_code == 200
         assert lens.store.get_investigation(1).feedback == "up"
 
-        # Hành động: người ngoài danh sách duyệt bị từ chối và được ghi vào nhật ký kiểm toán
+        # Unauthorized action click is denied and recorded in the audit log
         assert slack_post(c, "act_restart", "1:restart", user="U999").status_code == 200
         log = lens.store.actions_for_incident(1)
         assert [(a.action, a.status) for a in log] == [("restart", "denied")]
@@ -116,19 +136,53 @@ def test_llm_settings_validation():
     assert build_synthesizer(s(), None) is None
     assert build_synthesizer(s(llm_provider="anthropic", llm_api_key="k", llm_model="m"), None) is not None
     assert build_synthesizer(s(llm_provider="openai-compatible", llm_base_url="http://x/v1", llm_model="m"), None)
-    for bad in (dict(llm_provider="anthropic", llm_api_key="k"), dict(llm_provider="anthropic", llm_model="m"),
-                dict(llm_provider="openai-compatible", llm_model="m")):
+    for bad in (
+        dict(llm_provider="anthropic", llm_api_key="k"),
+        dict(llm_provider="anthropic", llm_model="m"),
+        dict(llm_provider="openai-compatible", llm_model="m"),
+    ):
         with pytest.raises(ValueError):
             build_synthesizer(s(**bad), None)
 
 
 def test_real_wiring_from_config_files(tmp_path, monkeypatch):
-    """Khởi động ứng dụng thật từ file cấu hình (không tiêm service giả lập), ở chế độ dry-run."""
+    """Boot the real FastAPI app from shipped YAML configs without injected test doubles."""
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
-    settings = Settings(_env_file=None, enable_scheduler=False, database_url=f"sqlite:///{tmp_path}/il.db",
-                        digest_dir=tmp_path / "digests")
+    settings = Settings(
+        _env_file=None,
+        enable_scheduler=False,
+        database_url=f"sqlite:///{tmp_path}/il.db",
+        digest_dir=tmp_path / "digests",
+    )
     with TestClient(create_app(settings)) as c:
         assert c.post("/webhooks/alertmanager", json=SAMPLE).json()["critical"] == 1
         assert Path(c.post("/digest/run").json()["path"]).exists()
     with TestClient(create_app(settings)) as c:
         assert c.get("/incidents/1").json()["investigations"][0]["investigation"]["engine"] == "rules"
+
+
+def test_get_postmortem_is_read_only_and_preserves_manual_edits(lens, clock):
+    with client(lens) as c:
+        c.post("/webhooks/alertmanager", json=SAMPLE)
+
+    postmortem_file = lens.archive.root / "postmortems" / "INC-0001.md"
+    with client(lens) as c:
+        draft = c.get("/incidents/1/postmortem")
+        assert draft.status_code == 200 and "INC-0001" in draft.text
+        assert not postmortem_file.exists()
+
+    clock.now = START + timedelta(minutes=25)
+    asyncio.run(
+        lens.handle_alerts([make_alert(fp="a1b2c3d4e5f60001", status="resolved", starts_at=START, ends_at=clock.now)])
+    )
+    asyncio.run(lens.drain())
+    assert postmortem_file.exists()
+
+    edited = postmortem_file.read_text(encoding="utf-8") + "\nManual postmortem edit by engineer.\n"
+    postmortem_file.write_text(edited, encoding="utf-8")
+
+    with client(lens) as c:
+        fetched = c.get("/incidents/1/postmortem")
+        assert fetched.status_code == 200
+        assert "Manual postmortem edit by engineer." in fetched.text
+    assert postmortem_file.read_text(encoding="utf-8") == edited

@@ -5,6 +5,7 @@ __pycache__/
 *.db
 digests/
 .pytest_cache/
+.mypy_cache/
 demo-output/
 .coverage
 .review-cache/

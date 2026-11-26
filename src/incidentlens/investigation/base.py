@@ -1,24 +1,25 @@
-"""Giao diện chung cho bộ máy điều tra và cách tính mức tin cậy."""
+"""Common investigation protocol and deterministic confidence scoring."""
 
 from __future__ import annotations
 
+from collections.abc import Set
 from typing import Protocol
 
 from incidentlens.models import Confidence, Investigation, InvestigationTarget
 
-# Bằng chứng TRỰC TIẾP về hành vi của hệ thống. "change" chỉ là trùng thời điểm,
-# "memory" chỉ là suy diễn từ sự cố cũ, nên hai loại này không tính.
+# Direct behavioral evidence. "change" is temporal correlation and "memory" is historical similarity,
+# so neither counts toward direct behavioral confirmation.
 DIRECT_KINDS = {"metric", "log", "dependency"}
 
 
-def confidence_for(kinds: set[str]) -> Confidence:
-    """Mức tin cậy do MÃ NGUỒN tính theo số nguồn bằng chứng độc lập, không lấy từ AI.
+def confidence_for(kinds: Set[str]) -> Confidence:
+    """Compute confidence deterministically from independent direct evidence kinds, never from an LLM.
 
-    - Cao: từ 2 nguồn bằng chứng trực tiếp trở lên
-    - Trung bình: 1 nguồn bằng chứng trực tiếp
-    - Thấp: chỉ trùng thời điểm hoặc giống sự cố cũ
+    - high: 2 or more independent direct evidence sources
+    - medium: 1 direct evidence source
+    - low: temporal correlation or historical similarity only
     """
-    direct = len(kinds & DIRECT_KINDS)
+    direct = len(set(kinds) & DIRECT_KINDS)
     if direct >= 2:
         return "high"
     return "medium" if direct == 1 else "low"

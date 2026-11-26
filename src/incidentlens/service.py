@@ -1,15 +1,16 @@
-"""Bộ điều phối: nối định tuyến, lưu trữ, gọi on-call, điều tra, digest, hành động và báo cáo."""
+"""Core workflow orchestrator: connects routing, storage, paging, investigation, digests, actions, and reports."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
+from typing import Any
 from weakref import WeakValueDictionary
 
-from incidentlens.actions.runner import ActionRunner
+from incidentlens.actions.runner import ActionResult, ActionRunner
 from incidentlens.catalog import ServiceCatalog
 from incidentlens.changes.github import ChangeProvider, NoChanges
 from incidentlens.digest.builder import group_alerts
@@ -19,6 +20,7 @@ from incidentlens.models import (
     Alert,
     AlertRecord,
     Change,
+    DeliveryStatus,
     IncidentRecord,
     InvestigationRecord,
     InvestigationTarget,
@@ -76,24 +78,28 @@ class IncidentLens:
         self._digest_investigations = digest_investigation_limit
         self._retention = retention
         self._clock = clock
-        self._tasks: set[asyncio.Task] = set()
-        self._alert_locks = WeakValueDictionary()
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._alert_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._service_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._digest_lock = asyncio.Lock()
 
-    def _spawn(self, coro: Coroutine) -> None:
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     async def drain(self) -> None:
-        """Chờ mọi việc nền (điều tra, đồng bộ Git) hoàn tất."""
+        """Await all in-flight background tasks (investigations and Git archive syncs)."""
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
-    # ---------- Nhận cảnh báo ----------
+    # ---------- Alert ingestion ----------
 
     def _alert_lock(self, fingerprint: str) -> asyncio.Lock:
         return self._alert_locks.setdefault(fingerprint, asyncio.Lock())
+
+    def _service_lock(self, service: str) -> asyncio.Lock:
+        return self._service_locks.setdefault(service, asyncio.Lock())
 
     async def handle_alerts(self, alerts: list[Alert]) -> dict[str, int]:
         counts = {"received": len(alerts), "critical": 0, "action": 0, "info": 0}
@@ -120,36 +126,61 @@ class IncidentLens:
                     await self._handle_critical(routed, record, now)
         return counts
 
-    def _queue_open(self, incident: IncidentRecord, page: dict, text: str,
-                    repeat: bool = False, created: bool = False) -> None:
+    def _pager_configured(self) -> bool:
+        return bool(getattr(self.pager, "configured", True))
+
+    def _notifier_configured(self) -> bool:
+        return bool(getattr(self.notifier, "configured", True))
+
+    def _queue_open(
+        self,
+        incident: IncidentRecord,
+        page: dict[str, Any],
+        text: str,
+        repeat: bool = False,
+        created: bool = False,
+    ) -> None:
         key = f"incident:{incident.id}:open"
-        page["dedup_key"] = (f"{incident.fingerprint}:incident:{incident.id}" if created
-                             else self.store.pager_key(incident))
-        self.store.queue_delivery(key + ":pager", incident.fingerprint, incident.id,
-                                  "pager", "open", page, repeat=repeat)
-        self.store.queue_delivery(key + ":slack", incident.fingerprint, incident.id,
-                                  "slack", "open", {"text": text})
+        page["dedup_key"] = (
+            f"{incident.fingerprint}:incident:{incident.id}" if created else self.store.pager_key(incident)
+        )
+        if self._pager_configured():
+            self.store.queue_delivery(
+                key + ":pager", incident.fingerprint, incident.id, "pager", "open", page, repeat=repeat
+            )
+        if self._notifier_configured():
+            self.store.queue_delivery(key + ":slack", incident.fingerprint, incident.id, "slack", "open", {"text": text})
 
     def _queue_resolve(self, incident: IncidentRecord) -> None:
-        self.store.queue_delivery(f"incident:{incident.id}:resolve:pager", incident.fingerprint, incident.id,
-                                  "pager", "resolve", {"dedup_key": self.store.pager_key(incident)})
+        if self._pager_configured():
+            self.store.queue_delivery(
+                f"incident:{incident.id}:resolve:pager",
+                incident.fingerprint,
+                incident.id,
+                "pager",
+                "resolve",
+                {"dedup_key": self.store.pager_key(incident)},
+            )
 
     async def _deliver_notifications(self, fingerprint: str) -> None:
         for delivery in self.store.pending_deliveries(fingerprint):
             payload = delivery["payload"]
             try:
                 if delivery["channel"] == "pager":
-                    sent = (await self.pager.trigger(**payload) if delivery["event"] == "open"
-                            else await self.pager.resolve(payload["dedup_key"]))
+                    sent = (
+                        await self.pager.trigger(**payload)
+                        if delivery["event"] == "open"
+                        else await self.pager.resolve(payload["dedup_key"])
+                    )
                 else:
                     text = payload["text"]
                     if delivery["event"] == "open" and any(
                         d["channel"] == "pager" and d["event"] == "open"
                         for d in self.store.pending_deliveries(fingerprint)
                     ):
-                        text = "<!channel> ⚠️ Không gọi được PagerDuty — cần người nhận xử lý ngay!\n" + text
+                        text = "<!channel> ⚠️ Could not reach PagerDuty — immediate human attention required!\n" + text
                     sent = await self.notifier.send(text)
-                if sent:
+                if sent or sent == DeliveryStatus.NOT_CONFIGURED:
                     self.store.finish_delivery(delivery["key"])
             except Exception:
                 log.exception("Notification delivery failed: %s", delivery["key"])
@@ -163,12 +194,21 @@ class IncidentLens:
     async def _handle_critical(self, routed: RoutedAlert, record: AlertRecord, now: datetime) -> None:
         alert = routed.alert
         incident, created = self.store.open_incident(record, "critical", now)
-        text = f"🔴 *{esc(alert.name)}* trên `{esc(alert.service)}` · {incident.code}\n{esc(alert.summary)}"
+        text = f"🔴 *{esc(alert.name)}* on `{esc(alert.service)}` · {incident.code}\n{esc(alert.summary)}"
         if alert.source_url:
-            text += "\n" + link(alert.source_url, "Xem nguồn")
-        self._queue_open(incident, dict(
-            dedup_key=alert.fingerprint, summary=f"{alert.name} trên {alert.service}: {alert.summary}",
-            source=alert.service, details=alert.labels, link=alert.source_url), text, repeat=True, created=created)
+            text += "\n" + link(alert.source_url, "View source")
+        page: dict[str, Any] = dict(
+            dedup_key=alert.fingerprint,
+            summary=f"{alert.name} on {alert.service}: {alert.summary}",
+            source=alert.service,
+            details=alert.labels,
+            link=alert.source_url,
+        )
+        self._queue_open(incident, page, text, repeat=True, created=created)
+        if not self._pager_configured():
+            await self.pager.trigger(**page)
+        if not self._notifier_configured():
+            await self.notifier.send(text)
         await self._deliver_notifications(alert.fingerprint)
         if created:
             self._spawn(self.investigate(InvestigationTarget.from_record(record), incident))
@@ -187,23 +227,33 @@ class IncidentLens:
             return
         key = f"incident:{incident.id}:resolve"
         self._queue_resolve(incident)
-        path = self.write_postmortem(incident.id)
-        text = (f"✅ Đã hồi phục: *{esc(incident.name)}* trên `{esc(incident.service)}` · {incident.code} · "
-                f"{incident.duration_minutes} phút\nBản nháp postmortem: `{path}`")
-        self.store.queue_delivery(key + ":slack", alert.fingerprint, incident.id,
-                                  "slack", "resolve", {"text": text})
+        if not self._pager_configured():
+            await self.pager.resolve(self.store.pager_key(incident))
+        path = self.write_postmortem(incident.id, overwrite=False)
+        text = (
+            f"✅ Resolved: *{esc(incident.name)}* on `{esc(incident.service)}` · {incident.code} · "
+            f"{incident.duration_minutes} minutes\nPostmortem draft: `{path}`"
+        )
+        if self._notifier_configured():
+            self.store.queue_delivery(key + ":slack", alert.fingerprint, incident.id, "slack", "resolve", {"text": text})
+        else:
+            await self.notifier.send(text)
         await self._deliver_notifications(alert.fingerprint)
         self._spawn(asyncio.to_thread(self.archive.sync, f"Postmortem {incident.code}"))
 
-    # ---------- Điều tra ----------
+    # ---------- Investigation & feedback ----------
 
-    async def investigate(self, target: InvestigationTarget, incident: IncidentRecord | None = None,
-                          announce: bool = True) -> InvestigationRecord | None:
+    async def investigate(
+        self,
+        target: InvestigationTarget,
+        incident: IncidentRecord | None = None,
+        announce: bool = True,
+    ) -> InvestigationRecord | None:
         try:
             result = await asyncio.wait_for(self.investigator.investigate(target), self._investigation_timeout)
         except Exception:
-            # Điều tra thất bại không bao giờ được ảnh hưởng tới việc gọi on-call
-            log.exception("Điều tra tự động thất bại cho %s", target.fingerprint)
+            # Investigation failures must never disrupt paging or alert ingestion.
+            log.exception("Automated investigation failed for %s", target.fingerprint)
             return None
         if result is None:
             return None
@@ -215,40 +265,80 @@ class IncidentLens:
         return record
 
     def record_feedback(self, investigation_id: int, choice: int, user: str) -> str:
-        """choice = 0: không giả thuyết nào đúng; choice = n: giả thuyết thứ n đúng."""
+        """Record hypothesis feedback (choice=0: none correct; choice=n: nth hypothesis correct)."""
         record = self.store.get_investigation(investigation_id)
         if record is None:
-            raise LookupError("Không tìm thấy cuộc điều tra")
+            raise LookupError("Investigation not found")
         hypotheses = record.investigation.hypotheses
         if not 0 <= choice <= len(hypotheses):
-            raise ValueError("Lựa chọn không hợp lệ")
+            raise ValueError("Invalid hypothesis choice")
         if choice == 0:
             self.store.set_feedback(investigation_id, "down", None, user, self._clock())
-            return "👎 Đã ghi nhận: không giả thuyết nào đúng. Cảm ơn bạn, phản hồi này giúp hệ thống cải thiện."
+            if record.incident_id:
+                self.store.apply_hypothesis_feedback(record.incident_id, investigation_id, None)
+            return "👎 Recorded: none of the hypotheses were correct. Thank you for the feedback."
         self.store.set_feedback(investigation_id, "up", choice, user, self._clock())
         if record.incident_id:
-            # Giả thuyết được xác nhận trở thành nguyên nhân của sự cố → đi vào trí nhớ sự cố
-            self.store.set_resolution(record.incident_id, root_cause=hypotheses[choice - 1].statement)
-        return f"✅ Đã ghi nhận giả thuyết {choice} là đúng. Cảm ơn bạn!"
+            self.store.apply_hypothesis_feedback(record.incident_id, investigation_id, hypotheses[choice - 1].statement)
+        return f"✅ Recorded hypothesis {choice} as correct. Thank you!"
 
-    # ---------- Hành động có người duyệt ----------
+    # ---------- Human-approved actions ----------
 
     async def run_action(self, incident_id: int, action: str, user_id: str, user_name: str) -> str:
         incident = self.store.get_incident(incident_id)
         if incident is None:
-            raise LookupError("Không tìm thấy sự cố")
-        result = await self.actions.run(action, incident.service, user_id)
-        self.store.log_action(self._clock(), incident_id, action, incident.service, f"{user_name} ({user_id})",
-                              result.status, result.exit_code, result.output)
-        if result.status == "executed":
-            self.store.set_resolution(incident_id, fix=f"{self.actions.label(action)} (duyệt bởi {user_name})",
-                                      only_if_empty=True)
+            raise LookupError("Incident not found")
+        async with self._service_lock(incident.service):
+            incident = self.store.get_incident(incident_id)
+            if incident is None:
+                raise LookupError("Incident not found")
+            now = self._clock()
+            if incident.resolved_at is not None:
+                result = ActionResult(
+                    status="denied",
+                    message="Incident is already resolved; actions are disabled",
+                )
+            elif (denied := self.actions.authorize(action, incident.service, user_id)) is not None:
+                result = denied
+            else:
+                cooldown = timedelta(seconds=self.actions.cooldown_for(action))
+                last = self.store.last_executed_action(incident.service)
+                if cooldown > timedelta(0) and last is not None and (now - last.at) < cooldown:
+                    remaining = max(1, int((cooldown - (now - last.at)).total_seconds()))
+                    result = ActionResult(
+                        status="denied",
+                        message=f"Service `{incident.service}` is in cooldown after `{last.action}` ({remaining}s remaining)",
+                    )
+                else:
+                    result = await self.actions.run(action, incident.service, user_id)
+            self.store.log_action(
+                self._clock(),
+                incident_id,
+                action,
+                incident.service,
+                f"{user_name} ({user_id})",
+                result.status,
+                result.exit_code,
+                result.output,
+            )
+            if result.status == "executed":
+                self.store.set_resolution(
+                    incident_id,
+                    fix=f"{self.actions.label(action)} (approved by {user_name})",
+                    only_if_empty=True,
+                )
         icon = {"executed": "✅", "dry-run": "🧪", "denied": "⛔", "failed": "❌"}[result.status]
         return f"{icon} {incident.code}: {result.message}"
 
-    async def handle_interaction(self, action_id: str, value: str, user_id: str, user_name: str,
-                                 response_url: str | None) -> str | None:
-        """Xử lý một lần bấm nút trên Slack (đã xác thực chữ ký ở lớp web)."""
+    async def handle_interaction(
+        self,
+        action_id: str,
+        value: str,
+        user_id: str,
+        user_name: str,
+        response_url: str | None,
+    ) -> str | None:
+        """Process a Slack button interaction (after Slack HMAC verification at the HTTP layer)."""
         try:
             if action_id.startswith("fb_"):
                 investigation_id, choice = value.split(":")
@@ -263,28 +353,38 @@ class IncidentLens:
         await self.notifier.respond(response_url, message)
         return message
 
-    # ---------- Leo thang ----------
+    # ---------- Escalation ----------
 
     async def check_escalations(self) -> list[str]:
         await self.retry_notifications()
-        escalated = []
+        escalated: list[str] = []
         for candidate in self.store.escalation_candidates():
             async with self._alert_lock(candidate.fingerprint):
                 now = self._clock()
                 record = self.store.get(candidate.fingerprint)
-                reason = self.router.escalation_reason(record, now) if record else None
+                if record is None:
+                    continue
+                reason = self.router.escalation_reason(record, now)
                 if not reason:
                     continue
                 incident, created = self.store.open_incident(record, "escalated", now)
-                text = (f"⬆️🔴 *Leo thang tự động:* {esc(record.name)} trên `{esc(record.service)}` · "
-                        f"{incident.code} — {reason}")
-                self._queue_open(incident, dict(
+                text = (
+                    f"⬆️🔴 *Auto-escalated:* {esc(record.name)} on `{esc(record.service)}` · "
+                    f"{incident.code} — {reason}"
+                )
+                page: dict[str, Any] = dict(
                     dedup_key=record.fingerprint,
-                    summary=f"[Leo thang] {record.name} trên {record.service}: {reason}",
+                    summary=f"[Escalated] {record.name} on {record.service}: {reason}",
                     source=record.service,
                     details={"reason": reason, "first_seen": record.first_seen.isoformat()},
-                    link=record.source_url), text, created=created)
+                    link=record.source_url,
+                )
+                self._queue_open(incident, page, text, created=created)
                 self.store.mark_escalated(record.fingerprint, now)
+                if not self._pager_configured():
+                    await self.pager.trigger(**page)
+                if not self._notifier_configured():
+                    await self.notifier.send(text)
                 await self._deliver_notifications(record.fingerprint)
                 if created:
                     self._spawn(self.investigate(InvestigationTarget.from_record(record), incident))
@@ -301,10 +401,13 @@ class IncidentLens:
         now = self._clock()
         records = self.store.pending_for_digest()
         last = self.store.kv_get("last_digest_at")
-        window_start = datetime.fromisoformat(last) if last else (
-            min(r.first_seen for r in records) if records else now)
+        window_start = (
+            datetime.fromisoformat(last)
+            if last
+            else (min(r.first_seen for r in records) if records else now)
+        )
         if not records:
-            log.info("Không có cảnh báo nào cho digest")
+            log.info("No pending alerts for digest")
             return None
 
         groups = group_alerts(records, self.catalog)
@@ -313,7 +416,8 @@ class IncidentLens:
         for group in groups:
             if group.service not in cache:
                 cache[group.service] = await self.changes.recent_changes(
-                    group.service, group.first_seen - self._lookback)
+                    group.service, group.first_seen - self._lookback
+                )
             group.changes = cache[group.service]
             if budget > 0 and group.is_ongoing and group.severity is Severity.ACTION:
                 budget -= 1
@@ -324,40 +428,59 @@ class IncidentLens:
         self.store.mark_digest_snapshot(records)
         self.store.kv_set("last_digest_at", now.isoformat())
         ongoing = sum(1 for g in groups if g.is_ongoing)
-        await self.notifier.send(f"📋 Digest mới: {len(groups)} mục ({ongoing} đang xảy ra) · `{path}`")
+        await self.notifier.send(f"📋 New digest: {len(groups)} group(s) ({ongoing} ongoing) · `{path}`")
         self._spawn(asyncio.to_thread(self.archive.sync, f"Digest {now:%Y-%m-%d %H:%M}"))
         return path
 
-    # ---------- Postmortem, báo cáo, bảo trì ----------
+    # ---------- Postmortem, ROI, and maintenance ----------
 
-    def write_postmortem(self, incident_id: int) -> Path:
+    def _render_incident_postmortem(self, incident: IncidentRecord) -> str:
+        return render_postmortem(
+            incident,
+            self.store.investigations_for_incident(incident.id),
+            self.store.actions_for_incident(incident.id),
+            self.catalog.get(incident.service).team,
+        )
+
+    def read_postmortem(self, incident_id: int) -> str:
         incident = self.store.get_incident(incident_id)
         if incident is None:
-            raise LookupError("Không tìm thấy sự cố")
-        markdown = render_postmortem(
-            incident, self.store.investigations_for_incident(incident_id),
-            self.store.actions_for_incident(incident_id), self.catalog.get(incident.service).team)
-        return self.archive.write_named(f"postmortems/{incident.code}.md", markdown)
+            raise LookupError("Incident not found")
+        path = self.archive.root / f"postmortems/{incident.code}.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return self._render_incident_postmortem(incident)
+
+    def write_postmortem(self, incident_id: int, *, overwrite: bool = True) -> Path:
+        incident = self.store.get_incident(incident_id)
+        if incident is None:
+            raise LookupError("Incident not found")
+        relative = f"postmortems/{incident.code}.md"
+        path = self.archive.root / relative
+        if not overwrite and path.exists():
+            return path
+        return self.archive.write_named(relative, self._render_incident_postmortem(incident))
 
     async def publish_roi(self, month_start: datetime, announce: bool = True) -> tuple[Path, str]:
         report = compute_roi(self.store, self.baseline, month_start, self._clock())
         markdown = render_roi(report)
         path = self.archive.write_named(f"reports/roi-{month_start:%Y-%m}.md", markdown)
         if announce:
-            accuracy = "chưa có đánh giá" if report.accuracy is None else f"{report.accuracy * 100:.0f}%"
+            accuracy = "unrated" if report.accuracy is None else f"{report.accuracy * 100:.0f}%"
             await self.notifier.send(
-                f"📊 Báo cáo tháng {report.month}: {report.episodes} cảnh báo → {report.interruptions} lần gọi on-call · "
-                f"giả thuyết đúng {accuracy} · tiết kiệm ~{report.hours_saved:.1f} giờ · `{path}`")
-            self._spawn(asyncio.to_thread(self.archive.sync, f"Báo cáo ROI {month_start:%Y-%m}"))
+                f"📊 Monthly report {report.month}: {report.episodes} episodes → {report.interruptions} pages · "
+                f"confirmed hypotheses {accuracy} · saved ~{report.hours_saved:.1f} hours · `{path}`"
+            )
+            self._spawn(asyncio.to_thread(self.archive.sync, f"ROI report {month_start:%Y-%m}"))
         return path, markdown
 
-    async def run_maintenance(self) -> dict:
-        """Chạy hằng ngày: dọn dữ liệu cũ và phát hành báo cáo ROI của tháng trước (một lần)."""
+    async def run_maintenance(self) -> dict[str, Any]:
+        """Run daily retention cleanup and publish the previous month's ROI report once."""
         now = self._clock()
         purged = self.store.purge(now - self._retention)
         previous = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)).replace(day=1)
         label = f"{previous:%Y-%m}"
-        report = None
+        report: str | None = None
         if self.store.kv_get("last_roi_month") != label:
             end = (previous + timedelta(days=32)).replace(day=1)
             if self.store.count_episodes(previous, end) or self.store.incidents_between(previous, end):

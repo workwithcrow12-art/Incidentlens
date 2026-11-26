@@ -1,4 +1,4 @@
-"""Tín hiệu cần kiểm tra khi điều tra, và phép so sánh "trước sự cố" với "trong sự cố"."""
+"""Investigation signal definitions and pre-incident vs during-incident comparisons."""
 
 from __future__ import annotations
 
@@ -13,16 +13,16 @@ from pydantic import BaseModel, Field
 class Signal(BaseModel):
     name: str
     title: str
-    query: str  # PromQL, dùng {service} làm chỗ điền tên dịch vụ; nên trả về 1 chuỗi số
+    query: str  # PromQL template with {service} placeholder; should return a numeric series
     category: Literal["errors", "latency", "saturation", "restarts", "traffic"] = "errors"
     direction: Literal["up", "down"] = "up"
-    min_ratio: float = 2.0  # bất thường khi thay đổi ít nhất ngần này lần
-    min_abs: float = 0.0  # và chênh lệch tuyệt đối ít nhất ngần này
+    min_ratio: float = 2.0  # minimum relative change to count as anomalous
+    min_abs: float = 0.0  # minimum absolute delta to ignore near-zero noise
     unit: Literal["", "s", "ms", "ratio", "bytes"] = ""
 
 
 class LogQuery(BaseModel):
-    query: str  # LogQL, dùng {service}
+    query: str  # LogQL template with {service} placeholder
     min_lines: int = 5
 
 
@@ -49,7 +49,7 @@ class Anomaly(BaseModel):
 
 
 def compare(signal: Signal, baseline: list[float], current: list[float]) -> Anomaly | None:
-    """Trả về Anomaly nếu giá trị trong sự cố lệch đáng kể so với trước sự cố."""
+    """Return an Anomaly when the incident window deviates significantly from the baseline window."""
     if not current:
         return None
     base = fmean(baseline) if baseline else 0.0
@@ -58,7 +58,7 @@ def compare(signal: Signal, baseline: list[float], current: list[float]) -> Anom
         big, small = cur, base
     else:
         if not baseline:
-            return None  # không có số liệu trước đó thì không thể nói là "giảm"
+            return None  # Cannot claim a drop when there is no pre-incident baseline
         big, small = base, cur
     if big - small < signal.min_abs or big <= small:
         return None

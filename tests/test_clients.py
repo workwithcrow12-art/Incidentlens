@@ -1,9 +1,9 @@
-"""Kiểm tra mã gọi và đọc API thật (Prometheus, Loki, GitHub, Slack, PagerDuty, LLM) qua HTTP giả lập."""
+"""HTTP client tests for Prometheus, Loki, GitHub, Slack, PagerDuty, and LLM adapters."""
 
+from datetime import timedelta
 import hashlib
 import hmac
 import json
-from datetime import timedelta
 
 import httpx
 import pytest
@@ -14,6 +14,7 @@ from incidentlens.changes.github import GitHubChangeProvider
 from incidentlens.investigation.llm import AnthropicLLM, OpenAICompatibleLLM
 from incidentlens.investigation.loki import LokiClient, top_patterns
 from incidentlens.investigation.prometheus import PrometheusClient
+from incidentlens.models import DeliveryStatus
 from incidentlens.outputs.pagerduty import PagerDutyPager
 from incidentlens.outputs.slack import SlackNotifier, verify_slack_signature
 from incidentlens.testing import CONFIG
@@ -87,11 +88,11 @@ async def test_github_deployments(world):
     changes = await gh.recent_changes("auth-service", START - timedelta(hours=2))
     assert [(c.ref, c.author, c.kind) for c in changes] == [("a1b2c3d", "dev-a", "deploy")]
     assert changes[0].url.endswith("/commit/a1b2c3d4e5f6a7b8c9d0")
-    assert await gh.recent_changes("auth-service", START) == []  # trước mốc `since`
-    assert await gh.recent_changes("user-db", START - timedelta(hours=2)) == []  # không có repo
+    assert await gh.recent_changes("auth-service", START) == []  # Before `since` cutoff
+    assert await gh.recent_changes("user-db", START - timedelta(hours=2)) == []  # Unmapped repo
 
     world.fail_hosts.add("api.github.com")
-    assert await gh.recent_changes("auth-service", START - timedelta(hours=2)) == []  # lỗi không làm hỏng luồng
+    assert await gh.recent_changes("auth-service", START - timedelta(hours=2)) == []  # Graceful degradation
 
 
 async def test_slack_bot_webhook_and_dry_run(world):
@@ -102,14 +103,14 @@ async def test_slack_bot_webhook_and_dry_run(world):
     assert await SlackNotifier(world.client(), webhook_url="https://hooks.slack.com/services/T/B/x").send("yo")
     assert world.slack[-1] == {"text": "yo"}
 
-    assert await SlackNotifier(world.client()).send("nobody") is False  # dry-run
+    assert await SlackNotifier(world.client()).send("nobody") == DeliveryStatus.NOT_CONFIGURED
     world.fail_hosts.add("slack.com")
-    assert await SlackNotifier(world.client(), bot_token="xoxb", channel="#c").send("hi") is False
+    assert await SlackNotifier(world.client(), bot_token="xoxb", channel="#c").send("hi") == DeliveryStatus.FAILED
 
 
 async def test_slack_rejection_is_reported():
     client = mock(lambda r: httpx.Response(200, json={"ok": False, "error": "channel_not_found"}))
-    assert await SlackNotifier(client, bot_token="x", channel="#c").send("hi") is False
+    assert await SlackNotifier(client, bot_token="x", channel="#c").send("hi") == DeliveryStatus.FAILED
 
 
 async def test_slack_respond_only_to_slack(world):
@@ -124,8 +125,8 @@ def test_slack_signature():
     secret, body, ts = "s3cret", b"payload=%7B%7D", "1700000000"
     sig = "v0=" + hmac.new(secret.encode(), b"v0:" + ts.encode() + b":" + body, hashlib.sha256).hexdigest()
     assert verify_slack_signature(secret, ts, body, sig, now=1700000100)
-    assert not verify_slack_signature(secret, ts, body, sig, now=1700000900)  # phát lại sau 15 phút
-    assert not verify_slack_signature(secret, ts, body + b"x", sig, now=1700000100)  # nội dung bị sửa
+    assert not verify_slack_signature(secret, ts, body, sig, now=1700000900)  # Replayed after 15 minutes
+    assert not verify_slack_signature(secret, ts, body + b"x", sig, now=1700000100)  # Tampered body
     assert not verify_slack_signature("other", ts, body, sig, now=1700000100)
     assert not verify_slack_signature(secret, None, body, sig)
     assert not verify_slack_signature(secret, "abc", body, sig)
@@ -139,15 +140,15 @@ async def test_pagerduty_trigger_resolve_and_dry_run(world):
     assert event["payload"]["severity"] == "critical" and event["links"][0]["href"] == "http://src"
     assert await pager.resolve("fp1") and world.pages[-1]["event_action"] == "resolve"
 
-    assert await PagerDutyPager(None, world.client()).trigger("fp", "s", "svc") is False
+    assert await PagerDutyPager(None, world.client()).trigger("fp", "s", "svc") == DeliveryStatus.NOT_CONFIGURED
     world.fail_hosts.add("events.pagerduty.com")
-    assert await pager.trigger("fp", "s", "svc") is False
+    assert await pager.trigger("fp", "s", "svc") == DeliveryStatus.FAILED
 
 
 async def test_anthropic_client(world):
-    world.llm_reply = "xin chào"
+    world.llm_reply = "hello"
     llm = AnthropicLLM("key", "some-model", world.client())
-    assert await llm.complete("sys", "user") == "xin chào"
+    assert await llm.complete("sys", "user") == "hello"
     sent = world.llm_requests[-1]
     assert sent["model"] == "some-model" and sent["system"] == "sys"
     assert sent["messages"] == [{"role": "user", "content": "user"}]
@@ -157,7 +158,11 @@ async def test_openai_compatible_client():
     seen = {}
 
     def handler(request):
-        seen["url"], seen["auth"], seen["body"] = str(request.url), request.headers.get("authorization"), json.loads(request.content)
+        seen["url"], seen["auth"], seen["body"] = (
+            str(request.url),
+            request.headers.get("authorization"),
+            json.loads(request.content),
+        )
         return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
     llm = OpenAICompatibleLLM("http://llm.internal/v1/", "local-model", mock(handler), "k")

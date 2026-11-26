@@ -1,4 +1,4 @@
-"""Chuyển payload webhook của Prometheus Alertmanager thành Alert chuẩn hóa."""
+"""Normalize Prometheus Alertmanager webhook payloads into internal Alert models."""
 
 from __future__ import annotations
 
@@ -33,9 +33,9 @@ def _fallback_fingerprint(labels: dict[str, str]) -> str:
 
 
 def to_alerts(payload: AlertmanagerPayload) -> list[Alert]:
-    alerts = []
+    alerts: list[Alert] = []
     for a in payload.alerts:
-        # Alertmanager dùng "0001-01-01T00:00:00Z" cho cảnh báo chưa kết thúc
+        # Alertmanager uses "0001-01-01T00:00:00Z" as a sentinel for ongoing alerts.
         ends_at = a.endsAt if a.endsAt and a.endsAt.year > 1970 else None
         alerts.append(
             Alert(

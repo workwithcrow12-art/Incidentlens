@@ -1,4 +1,4 @@
-"""Gom các cảnh báo thành từng mục để hiển thị trong digest."""
+"""Group stored alerts into digest items."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from incidentlens.models import AlertGroup, AlertRecord
 
 
 def group_alerts(records: list[AlertRecord], catalog: ServiceCatalog) -> list[AlertGroup]:
-    """Nhóm theo (dịch vụ, loại cảnh báo). Sắp xếp: mức cao → đang xảy ra → nhiều cảnh báo."""
+    """Group by (service, alert name), sorted by severity, ongoing status, and receive count."""
     groups: dict[tuple[str, str], list[AlertRecord]] = defaultdict(list)
     for record in records:
         groups[(record.service, record.name)].append(record)

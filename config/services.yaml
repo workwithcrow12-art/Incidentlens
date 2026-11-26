@@ -1,8 +1,8 @@
-# Danh mục dịch vụ.
-#   team        đội phụ trách (hiển thị trong digest, postmortem)
-#   repo        repo GitHub để liên kết deploy gần đây
-#   depends_on  dịch vụ mà nó phụ thuộc: nếu các dịch vụ này đang có cảnh báo, đó là bằng chứng sự cố lan truyền
-#   runbook     link runbook, hiện thành nút trên thẻ điều tra
+# Service catalog.
+#   team        owning team (shown in digests and postmortems)
+#   repo        GitHub repository (org/repo) for deployment correlation
+#   depends_on  upstream/downstream dependencies checked for cascading alerts
+#   runbook     runbook URL rendered as a button on Slack investigation cards
 services:
   auth-service:
     team: Platform Team

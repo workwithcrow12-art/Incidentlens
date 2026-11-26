@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Test & Typecheck (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
+      - name: Typecheck with mypy
+        run: uv run --no-sync mypy src scripts
+      - name: Run tests with coverage
+        run: uv run --no-sync pytest --cov=incidentlens --cov-report=term-missing --cov-fail-under=95
+      - name: Run offline lifecycle demo
+        run: uv run --no-sync python -X utf8 scripts/demo.py
+      - name: Build sdist and wheel
+        run: uv build
+
+  postgres:
+    name: PostgreSQL Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: incidentlens
+          POSTGRES_PASSWORD: incidentlens
+          POSTGRES_DB: incidentlens_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U incidentlens -d incidentlens_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies with PostgreSQL driver
+        run: uv sync --locked --extra dev --extra postgres --python 3.12
+      - name: Run test suite against PostgreSQL
+        env:
+          IL_TEST_DATABASE_URL: postgresql+psycopg://incidentlens:incidentlens@localhost:5432/incidentlens_test
+        run: uv run --no-sync pytest -q
