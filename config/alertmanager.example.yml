@@ -1,0 +1,18 @@
+# Ví dụ cấu hình Alertmanager gửi cảnh báo tới IncidentLens.
+# Alertmanager lo phần gom nhóm và khử trùng lặp cơ bản (nguyên tắc #4: dùng lại công cụ sẵn có).
+route:
+  receiver: incidentlens
+  group_by: [alertname, service]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h
+
+receivers:
+  - name: incidentlens
+    webhook_configs:
+      - url: http://incidentlens:8000/webhooks/alertmanager
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: CHANGE_ME   # trùng với IL_WEBHOOK_TOKEN

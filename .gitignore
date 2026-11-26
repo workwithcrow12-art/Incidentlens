@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.db
+digests/
+.pytest_cache/
+demo-output/
+.coverage
+.review-cache/
+dist/

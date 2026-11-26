@@ -1,0 +1,11 @@
+# Số liệu dùng cho báo cáo ROI hàng tháng.
+
+oncall_headcount: 10                          # số người trong lịch trực
+minutes_saved_per_correct_investigation: 20   # ước tính thời gian tiết kiệm cho mỗi cuộc điều tra đúng
+
+# Số đo TRƯỚC khi dùng IncidentLens (đo trong giai đoạn pilot).
+# Để null nếu chưa có: báo cáo sẽ ghi rõ là ước tính hoặc để trống.
+before:
+  interruptions_per_person_per_day: null
+  mttr_minutes: null
+  critical_incidents_per_month: null

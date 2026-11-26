@@ -1,0 +1,12 @@
+.git
+.venv
+.review-cache
+.pytest_cache
+__pycache__
+*.pyc
+.env
+*.db
+.coverage
+dist
+demo-output
+digests

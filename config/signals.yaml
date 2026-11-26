@@ -1,0 +1,52 @@
+# Tín hiệu mà bộ máy điều tra kiểm tra khi có sự cố. Chỉ cần quyền ĐỌC vào Prometheus và Loki.
+# Mỗi tín hiệu được so sánh giữa "trước sự cố" và "trong sự cố".
+#   {service}  sẽ được thay bằng tên dịch vụ (đã kiểm tra an toàn trước khi chèn)
+#   min_ratio  bất thường khi thay đổi ít nhất ngần này lần
+#   min_abs    và chênh lệch tuyệt đối ít nhất ngần này (tránh báo động với số quá nhỏ)
+# Hãy sửa các câu truy vấn cho khớp với tên metric trong hệ thống của bạn.
+
+baseline_minutes: 60   # so với 60 phút trước sự cố
+guard_minutes: 5       # bắt đầu xem từ 5 phút trước khi cảnh báo bắn
+
+signals:
+  - name: error_rate
+    title: Tỉ lệ lỗi 5xx
+    category: errors
+    unit: ratio
+    min_ratio: 2
+    min_abs: 0.01
+    query: 'sum(rate(http_requests_total{service="{service}",status=~"5.."}[5m])) / sum(rate(http_requests_total{service="{service}"}[5m]))'
+
+  - name: latency_p95
+    title: Độ trễ p95
+    category: latency
+    unit: s
+    min_ratio: 2
+    min_abs: 0.05
+    query: 'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="{service}"}[5m])))'
+
+  - name: memory
+    title: Bộ nhớ sử dụng
+    category: saturation
+    unit: bytes
+    min_ratio: 1.5
+    min_abs: 104857600   # 100 MB
+    query: 'max(container_memory_working_set_bytes{pod=~"{service}-.*",container!=""})'
+
+  - name: cpu
+    title: CPU sử dụng (số nhân)
+    category: saturation
+    min_ratio: 2
+    min_abs: 0.2
+    query: 'sum(rate(container_cpu_usage_seconds_total{pod=~"{service}-.*",container!=""}[5m]))'
+
+  - name: restarts
+    title: Số lần pod khởi động lại
+    category: restarts
+    min_ratio: 2
+    min_abs: 1
+    query: 'sum(increase(kube_pod_container_status_restarts_total{pod=~"{service}-.*"}[10m]))'
+
+logs:
+  min_lines: 5
+  query: '{service="{service}"} |~ "(?i)(error|exception|fatal|panic)"'

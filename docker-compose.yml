@@ -1,0 +1,30 @@
+services:
+  incidentlens:
+    build: .
+    ports: ["8000:8000"]
+    env_file: .env
+    environment:
+      IL_DATABASE_URL: postgresql+psycopg://incidentlens:incidentlens@db:5432/incidentlens
+    volumes:
+      - ./digests:/app/digests
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    # Có sẵn pgvector cho "trí nhớ sự cố" ở Giai đoạn 3
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: incidentlens
+      POSTGRES_PASSWORD: incidentlens
+      POSTGRES_DB: incidentlens
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U incidentlens -d incidentlens"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

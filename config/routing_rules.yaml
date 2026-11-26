@@ -1,0 +1,33 @@
+# Luật định tuyến cảnh báo — do CON NGƯỜI viết và duyệt, AI không được sửa.
+# Luật được xét từ trên xuống, luật đầu tiên khớp sẽ quyết định mức.
+#   match:    so khớp chính xác theo label
+#   match_re: so khớp regex (toàn bộ giá trị) theo label
+# Mức: critical (🔴 gọi ngay) · action (🟡 vào digest) · info (⚪ chỉ ghi lại)
+
+default_severity: info
+
+rules:
+  - name: critical-label
+    match: { severity: critical }
+    severity: critical
+
+  - name: slo-burn
+    match_re: { alertname: "SLO.*BurnRate.*" }
+    severity: critical
+
+  - name: security
+    match: { category: security }
+    severity: critical
+
+  - name: warning-label
+    match: { severity: warning }
+    severity: action
+
+  - name: info-label
+    match: { severity: info }
+    severity: info
+
+# Luật leo thang: 🟡 tự động nâng lên 🔴 và gọi on-call khi
+escalation:
+  max_pending_minutes: 240   # vẫn đang xảy ra sau ngần này phút
+  max_receive_count: null    # hoặc nhận lặp lại quá N lần (null = tắt)

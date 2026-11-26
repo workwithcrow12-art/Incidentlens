@@ -1,0 +1,22 @@
+# Danh sách hành động ĐƯỢC PHÉP chạy từ nút bấm trên Slack.
+# - Chỉ người có Slack user ID trong `approvers` mới bấm được. Để rỗng = không ai được phép.
+# - Lệnh là danh sách tham số (không qua shell). {service} được thay bằng tên dịch vụ.
+# - Mặc định IL_ACTIONS_ENABLED=false: chỉ hiển thị lệnh SẼ chạy, không chạy thật.
+# - Máy chạy IncidentLens cần có kubectl và quyền RBAC giới hạn đúng các lệnh dưới đây.
+
+actions:
+  rollback:
+    label: "🔄 Rollback"
+    command: ["kubectl", "rollout", "undo", "deployment/{service}", "-n", "production"]
+    services: ["auth-service", "payment-worker"]
+    approvers: []          # ví dụ: ["U012ABCDEF", "U034GHIJKL"]
+    confirm: "Rollback `{service}` về phiên bản trước? Nếu cần phân tích nguyên nhân, hãy lấy memory dump TRƯỚC khi rollback."
+    timeout_seconds: 120
+
+  restart:
+    label: "♻️ Restart"
+    command: ["kubectl", "rollout", "restart", "deployment/{service}", "-n", "production"]
+    services: ["*"]
+    approvers: []
+    confirm: "Restart toàn bộ pod của `{service}`? Trạng thái trong bộ nhớ sẽ mất."
+    timeout_seconds: 120
