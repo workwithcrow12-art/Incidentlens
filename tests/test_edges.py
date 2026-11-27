@@ -30,8 +30,38 @@ async def test_periodic_job_survives_errors():
     assert len(calls) >= 3  # First failure does not terminate the schedule
 
 
+async def test_scheduled_jobs_run_immediately_and_preserve_timer_across_restarts(lens, clock):
+    runs = []
+
+    async def job():
+        runs.append(clock.now)
+
+    # First startup: runs immediately without sleeping the full 4-hour interval first.
+    first = asyncio.create_task(_every(14400, job, store=lens.store, name="digest", clock=clock))
+    await asyncio.sleep(0.02)
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    assert len(runs) == 1
+
+    # Restart 3 hours into a 4-hour interval: waits the remaining hour instead of running early or resetting to 4h.
+    clock.now += timedelta(hours=3)
+    mid_interval = asyncio.create_task(_every(14400, job, store=lens.store, name="digest", clock=clock))
+    await asyncio.sleep(0.02)
+    mid_interval.cancel()
+    await asyncio.gather(mid_interval, return_exceptions=True)
+    assert len(runs) == 1
+
+    # Restart after the 4-hour interval has elapsed: runs immediately on startup.
+    clock.now += timedelta(hours=1, minutes=5)
+    overdue = asyncio.create_task(_every(14400, job, store=lens.store, name="digest", clock=clock))
+    await asyncio.sleep(0.02)
+    overdue.cancel()
+    await asyncio.gather(overdue, return_exceptions=True)
+    assert len(runs) == 2
+
+
 def test_scheduler_starts_and_stops_cleanly(lens):
-    settings = Settings(_env_file=None, enable_scheduler=True)
+    settings = Settings(_env_file=None, enable_scheduler=True, webhook_token="tok")
     with TestClient(create_app(settings, service=lens)) as c:
         assert c.get("/healthz").status_code == 200
 

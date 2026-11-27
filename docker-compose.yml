@@ -1,10 +1,11 @@
 services:
   incidentlens:
     build: .
-    ports: ["8000:8000"]
+    ports: ["${IL_BIND_HOST:-127.0.0.1}:8000:8000"]
     env_file: .env
     environment:
       IL_DATABASE_URL: postgresql+psycopg://incidentlens:incidentlens@db:5432/incidentlens
+      IL_WEBHOOK_TOKEN: ${IL_WEBHOOK_TOKEN:?Set a non-empty IL_WEBHOOK_TOKEN in .env}
     volumes:
       - ./digests:/app/digests
     depends_on:

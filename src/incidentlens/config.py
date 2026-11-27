@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,6 +14,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./incidentlens.db"
     public_url: str = "http://localhost:8000"
     webhook_token: str | None = None
+    allow_unauthenticated: bool = False
     rules_path: Path = Path("config/routing_rules.yaml")
     services_path: Path = Path("config/services.yaml")
     signals_path: Path = Path("config/signals.yaml")
@@ -56,3 +58,27 @@ class Settings(BaseSettings):
 
     # Human-approved one-click actions (dry-run by default)
     actions_enabled: bool = False
+
+    @field_validator(
+        "webhook_token",
+        "pagerduty_routing_key",
+        "slack_webhook_url",
+        "slack_bot_token",
+        "slack_channel",
+        "slack_signing_secret",
+        "github_token",
+        "prometheus_url",
+        "prometheus_bearer_token",
+        "loki_url",
+        "grafana_url",
+        "llm_api_key",
+        "llm_model",
+        "llm_base_url",
+        mode="before",
+    )
+    @classmethod
+    def _blank_to_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value

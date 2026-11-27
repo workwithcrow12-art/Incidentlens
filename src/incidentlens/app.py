@@ -32,6 +32,7 @@ from incidentlens.investigation.loki import LokiClient
 from incidentlens.investigation.prometheus import PrometheusClient
 from incidentlens.investigation.signals import SignalConfig
 from incidentlens.memory.similarity import IncidentMemory
+from incidentlens.models import as_utc
 from incidentlens.outputs.archive import DigestArchive
 from incidentlens.outputs.pagerduty import PagerDutyPager
 from incidentlens.outputs.slack import SlackNotifier, verify_slack_signature
@@ -100,13 +101,31 @@ def build_service(settings: Settings, http: httpx.AsyncClient) -> IncidentLens:
     )
 
 
-async def _every(seconds: float, job: Callable[[], Awaitable[object]]) -> None:
+async def _every(
+    seconds: float,
+    job: Callable[[], Awaitable[object]],
+    *,
+    store: Store | None = None,
+    name: str | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> None:
+    now_fn = clock or (lambda: datetime.now(timezone.utc))
+    delay = 0.0
+    if store is not None and name is not None:
+        last = store.kv_get(f"schedule:{name}")
+        if last is not None:
+            elapsed = (now_fn() - as_utc(datetime.fromisoformat(last))).total_seconds()
+            delay = max(0.0, seconds - elapsed)
+    if delay > 0:
+        await asyncio.sleep(delay)
     while True:
-        await asyncio.sleep(seconds)
         try:
             await job()
+            if store is not None and name is not None:
+                store.kv_set(f"schedule:{name}", now_fn().isoformat())
         except Exception:
             log.exception("Scheduled background job failed")
+        await asyncio.sleep(seconds)
 
 
 class ResolutionBody(BaseModel):
@@ -132,26 +151,59 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
             svc_instance = build_service(cfg, http)
         app.state.service = svc_instance
 
+        if not svc_instance._pager_configured():
+            log.warning("PagerDuty not configured (IL_PAGERDUTY_ROUTING_KEY is empty); nobody will be paged")
+        if not (cfg.webhook_token or "").strip() and not cfg.allow_unauthenticated:
+            log.warning("IL_WEBHOOK_TOKEN is not configured; protected API endpoints will reject requests")
+
         tasks: list[asyncio.Task[None]] = []
         if cfg.enable_scheduler:
             tasks = [
-                asyncio.create_task(_every(cfg.escalation_check_seconds, svc_instance.check_escalations)),
-                asyncio.create_task(_every(cfg.digest_interval_minutes * 60, svc_instance.run_digest)),
-                asyncio.create_task(_every(cfg.maintenance_interval_hours * 3600, svc_instance.run_maintenance)),
+                asyncio.create_task(
+                    _every(
+                        cfg.escalation_check_seconds,
+                        svc_instance.check_escalations,
+                        store=svc_instance.store,
+                        name="escalations",
+                        clock=svc_instance._clock,
+                    )
+                ),
+                asyncio.create_task(
+                    _every(
+                        cfg.digest_interval_minutes * 60,
+                        svc_instance.run_digest,
+                        store=svc_instance.store,
+                        name="digest",
+                        clock=svc_instance._clock,
+                    )
+                ),
+                asyncio.create_task(
+                    _every(
+                        cfg.maintenance_interval_hours * 3600,
+                        svc_instance.run_maintenance,
+                        store=svc_instance.store,
+                        name="maintenance",
+                        clock=svc_instance._clock,
+                    )
+                ),
             ]
         try:
             yield
         finally:
             for t in tasks:
                 t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             await svc_instance.drain()
             if http:
                 await http.aclose()
 
     def require_token(request: Request) -> None:
-        expected = cfg.webhook_token
+        expected = (cfg.webhook_token or "").strip()
         if not expected:
-            return
+            if cfg.allow_unauthenticated:
+                return
+            raise HTTPException(status_code=401, detail="IL_WEBHOOK_TOKEN is not configured")
         given = request.headers.get("authorization", "")
         if not hmac.compare_digest(given.encode(), f"Bearer {expected}".encode()):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
@@ -228,7 +280,7 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
 
     @app.post("/incidents/{incident_id}/resolution", dependencies=auth)
     async def set_resolution(incident_id: int, body: ResolutionBody, request: Request) -> dict[str, Any]:
-        incident = svc(request).store.set_resolution(incident_id, body.root_cause, body.fix)
+        incident = svc(request).set_resolution(incident_id, body.root_cause, body.fix)
         if incident is None:
             raise HTTPException(status_code=404, detail="Incident not found")
         return incident.model_dump(mode="json")

@@ -132,7 +132,9 @@ def test_slack_signature():
     assert not verify_slack_signature(secret, "abc", body, sig)
 
 
-async def test_pagerduty_trigger_resolve_and_dry_run(world):
+async def test_pagerduty_trigger_resolve_and_dry_run(world, caplog):
+    import logging
+
     pager = PagerDutyPager("rk", world.client())
     assert await pager.trigger("fp1", "boom", "svc", {"a": "b"}, "http://src")
     event = world.pages[-1]
@@ -140,7 +142,9 @@ async def test_pagerduty_trigger_resolve_and_dry_run(world):
     assert event["payload"]["severity"] == "critical" and event["links"][0]["href"] == "http://src"
     assert await pager.resolve("fp1") and world.pages[-1]["event_action"] == "resolve"
 
-    assert await PagerDutyPager(None, world.client()).trigger("fp", "s", "svc") == DeliveryStatus.NOT_CONFIGURED
+    with caplog.at_level(logging.WARNING):
+        assert await PagerDutyPager(None, world.client()).trigger("fp", "s", "svc") == DeliveryStatus.NOT_CONFIGURED
+    assert any(r.levelno == logging.WARNING and "PagerDuty not configured" in r.message for r in caplog.records)
     world.fail_hosts.add("events.pagerduty.com")
     assert await pager.trigger("fp", "s", "svc") == DeliveryStatus.FAILED
 

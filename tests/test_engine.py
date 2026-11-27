@@ -62,6 +62,20 @@ async def test_no_evidence_means_no_hypothesis(lens):
     assert inv.evidence == [] and inv.hypotheses == []
 
 
+async def test_missing_prometheus_baseline_creates_no_false_evidence(lens):
+    async def no_baseline_query_range(query, start, end, step=60):
+        if end < START:
+            return []
+        return [float(200 * 2**20)] * 5 if "memory" in query else [0.05] * 5
+
+    lens.investigator._prometheus.query_range = no_baseline_query_range
+    lens.investigator._loki = None
+    lens.investigator._changes = type("None_", (), {"recent_changes": staticmethod(lambda *a: _empty())})()
+
+    inv = await lens.investigator.investigate(target())
+    assert inv.evidence == [] and inv.hypotheses == []
+
+
 @pytest.mark.parametrize("minutes_after", [1, 5, 10, 60])
 async def test_deploy_after_incident_is_not_blamed(tmp_path, clock, minutes_after):
     world = SimulatedWorld(START, deploy_minutes_before=-minutes_after)

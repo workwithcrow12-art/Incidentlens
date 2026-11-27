@@ -31,21 +31,21 @@ signals:
     unit: bytes
     min_ratio: 1.5
     min_abs: 104857600   # 100 MB
-    query: 'max(container_memory_working_set_bytes{pod=~"{service}-.*",container!=""})'
+    query: 'max(container_memory_working_set_bytes{pod=~"{service}-([a-z0-9]{8,10}-[a-z0-9]{5}|[0-9]+)",container!=""})'
 
   - name: cpu
     title: CPU usage (cores)
     category: saturation
     min_ratio: 2
     min_abs: 0.2
-    query: 'sum(rate(container_cpu_usage_seconds_total{pod=~"{service}-.*",container!=""}[5m]))'
+    query: 'sum(rate(container_cpu_usage_seconds_total{pod=~"{service}-([a-z0-9]{8,10}-[a-z0-9]{5}|[0-9]+)",container!=""}[5m]))'
 
   - name: restarts
     title: Pod restarts
     category: restarts
     min_ratio: 2
     min_abs: 1
-    query: 'sum(increase(kube_pod_container_status_restarts_total{pod=~"{service}-.*"}[10m]))'
+    query: 'sum(increase(kube_pod_container_status_restarts_total{pod=~"{service}-([a-z0-9]{8,10}-[a-z0-9]{5}|[0-9]+)"}[10m]))'
 
 logs:
   min_lines: 5

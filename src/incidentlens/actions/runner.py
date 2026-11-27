@@ -31,6 +31,7 @@ class ActionSpec(BaseModel):
     confirm: str | None = None
     timeout_seconds: int = 60
     cooldown_seconds: int = Field(default=300, ge=0)
+    confirm_repeat: bool = True
 
     @field_validator("command")
     @classmethod
@@ -96,6 +97,10 @@ class ActionRunner:
     def cooldown_for(self, name: str) -> int:
         spec = self._config.actions.get(name)
         return spec.cooldown_seconds if spec else 0
+
+    def requires_reconfirm(self, name: str) -> bool:
+        spec = self._config.actions.get(name)
+        return spec.confirm_repeat if spec else True
 
     def authorize(self, name: str, service: str, user_id: str) -> ActionResult | None:
         spec = self._config.actions.get(name)

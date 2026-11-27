@@ -20,11 +20,11 @@ from incidentlens.testing import make_alert, simulated_service
 SECRET = "slack-replay-test-secret"
 
 
-def signed_action(*, action_ts="12345.001", timestamp=None):
+def signed_action(*, action_id="act_restart", value="1:restart", action_ts="12345.001", timestamp=None):
     payload = {
         "type": "block_actions",
         "user": {"id": "U1", "username": "alice"},
-        "actions": [{"action_id": "act_restart", "value": "1:restart", "action_ts": action_ts}],
+        "actions": [{"action_id": action_id, "value": value, "action_ts": action_ts}],
     }
     body = urlencode({"payload": json.dumps(payload)}).encode()
     timestamp = timestamp or str(int(time.time()))
@@ -118,26 +118,53 @@ async def test_signed_retry_is_deduplicated_after_store_reopens(action_service):
 
 
 @pytest.mark.parametrize("change", ["body", "timestamp"])
-async def test_fresh_signed_action_respects_cooldown_then_can_repeat(action_service, clock, change):
+async def test_fresh_signed_action_respects_cooldown_and_requires_reconfirm(action_service, clock, change):
     from datetime import timedelta
 
     build, executed = action_service
     lens = build()
     timestamp = str(int(time.time()))
     first = signed_action(timestamp=timestamp)
-    during_cooldown = (signed_action(action_ts="12345.002", timestamp=timestamp) if change == "body"
-                       else signed_action(timestamp=str(int(timestamp) + 1)))
-    after_cooldown = (signed_action(action_ts="12345.003", timestamp=timestamp) if change == "body"
-                      else signed_action(timestamp=str(int(timestamp) + 2)))
+    during_cooldown = (
+        signed_action(action_ts="12345.002", timestamp=timestamp)
+        if change == "body"
+        else signed_action(timestamp=str(int(timestamp) + 1))
+    )
+    after_cooldown_unconfirmed = (
+        signed_action(action_ts="12345.003", timestamp=timestamp)
+        if change == "body"
+        else signed_action(timestamp=str(int(timestamp) + 2))
+    )
+    after_cooldown_confirmed = (
+        signed_action(
+            action_id="act_confirm_restart",
+            value="1:restart:confirm:1",
+            action_ts="12345.004",
+            timestamp=timestamp,
+        )
+        if change == "body"
+        else signed_action(
+            action_id="act_confirm_restart",
+            value="1:restart:confirm:1",
+            timestamp=str(int(timestamp) + 3),
+        )
+    )
     async with slack_client(lens) as client:
         assert (await client.post("/slack/interactions", **first)).status_code == 200
         assert (await client.post("/slack/interactions", **during_cooldown)).status_code == 200
         assert executed == [["restart-test", "auth-service"]]
         clock.now += timedelta(minutes=6)
-        assert (await client.post("/slack/interactions", **after_cooldown)).status_code == 200
+        assert (await client.post("/slack/interactions", **after_cooldown_unconfirmed)).status_code == 200
+        assert executed == [["restart-test", "auth-service"]]
+        assert (await client.post("/slack/interactions", **after_cooldown_confirmed)).status_code == 200
 
     assert executed == [["restart-test", "auth-service"], ["restart-test", "auth-service"]]
-    assert [row.status for row in lens.store.actions_for_incident(1)] == ["executed", "denied", "executed"]
+    assert [row.status for row in lens.store.actions_for_incident(1)] == [
+        "executed",
+        "denied",
+        "denied",
+        "executed",
+    ]
 
 
 async def test_invalid_signature_does_not_consume_a_valid_request(action_service):

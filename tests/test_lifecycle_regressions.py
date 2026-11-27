@@ -221,6 +221,7 @@ async def test_unconfigured_pagerduty_is_not_treated_as_failure_or_queued(lens, 
     assert world.pages == []
     assert len(world.slack) == 1
     assert "<!channel>" not in world.slack[0]["text"]
+    assert "PagerDuty not configured, nobody was paged" in world.slack[0]["text"]
     assert lens.store.pending_deliveries() == []
 
     clock.now += timedelta(minutes=1)
@@ -233,6 +234,42 @@ async def test_unconfigured_pagerduty_is_not_treated_as_failure_or_queued(lens, 
     await lens.drain()
     assert len(world.slack) == 2
     assert lens.store.pending_deliveries() == []
+
+    # Auto-escalated warnings also state in Slack that nobody was paged when PagerDuty is unconfigured.
+    warn = make_alert(name="DiskSpaceLow", service="db-replica-02", severity="warning", starts_at=clock.now)
+    await lens.handle_alerts([warn])
+    clock.now += timedelta(hours=5)
+    assert await lens.check_escalations() == ["db-replica-02-DiskSpaceLow"]
+    assert "PagerDuty not configured, nobody was paged" in world.slack[-1]["text"]
+
+
+async def test_alert_batch_delivers_concurrently_across_fingerprints(lens, clock, world):
+    lens.investigator = NoopInvestigator()
+    in_flight = 0
+    all_in_flight = asyncio.Event()
+
+    class ConcurrentPager:
+        configured = True
+
+        async def trigger(self, **kwargs):
+            nonlocal in_flight
+            in_flight += 1
+            if in_flight == 3:
+                all_in_flight.set()
+            await asyncio.wait_for(all_in_flight.wait(), timeout=1.0)
+            return True
+
+        async def resolve(self, dedup_key):
+            return True
+
+    lens.pager = ConcurrentPager()
+    batch = [
+        make_alert(name=f"Crit{i}", fp=f"crit-{i}", starts_at=START)
+        for i in range(3)
+    ]
+    counts = await asyncio.wait_for(lens.handle_alerts(batch), timeout=2.0)
+    assert counts["critical"] == 3
+    assert len(lens.store.list_incidents()) == 3
 
 
 async def test_unconfigured_slack_and_pagerduty_escalation_and_resolution_leave_no_queue(lens, clock, world):
@@ -255,3 +292,18 @@ async def test_unconfigured_slack_and_pagerduty_escalation_and_resolution_leave_
     await lens.drain()
     assert lens.store.pending_deliveries() == []
     assert postmortem.read_text(encoding="utf-8") == "Custom edited postmortem"
+
+
+async def test_drain_does_not_spin_when_task_completes_before_discard_callback(lens):
+    ready = asyncio.Event()
+
+    async def quick() -> None:
+        ready.set()
+
+    lens._spawn(quick())
+    await ready.wait()
+    # At this point `quick()` has just returned in the current event-loop turn, so `task.done()` is True
+    # while `task.add_done_callback(self._tasks.discard)` is still queued in `loop._ready`.
+    assert any(t.done() for t in lens._tasks)
+    await asyncio.wait_for(lens.drain(), timeout=1.0)
+    assert not lens._tasks

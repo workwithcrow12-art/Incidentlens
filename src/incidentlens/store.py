@@ -211,6 +211,8 @@ class Store:
             kwargs["connect_args"] = {"check_same_thread": False}
             if ":memory:" in url or url == "sqlite://":
                 kwargs["poolclass"] = StaticPool
+        else:
+            kwargs["pool_pre_ping"] = True
         self._engine = create_engine(url, **kwargs)
         Base.metadata.create_all(self._engine)
         self._session = sessionmaker(self._engine, expire_on_commit=False)
@@ -620,10 +622,25 @@ class Store:
         with self._session() as session:
             return [_action(r) for r in session.scalars(stmt)]
 
-    def last_executed_action(self, service: str) -> ActionRecord | None:
+    def last_attempted_action(self, service: str) -> ActionRecord | None:
         stmt = (
             select(ActionRow)
-            .where(ActionRow.service == service, ActionRow.status == "executed")
+            .where(ActionRow.service == service, ActionRow.status.in_(["executed", "failed"]))
+            .order_by(ActionRow.at.desc(), ActionRow.id.desc())
+            .limit(1)
+        )
+        with self._session() as session:
+            row = session.scalars(stmt).first()
+            return _action(row) if row else None
+
+    def last_incident_attempt(self, incident_id: int, action: str) -> ActionRecord | None:
+        stmt = (
+            select(ActionRow)
+            .where(
+                ActionRow.incident_id == incident_id,
+                ActionRow.action == action,
+                ActionRow.status.in_(["executed", "failed"]),
+            )
             .order_by(ActionRow.at.desc(), ActionRow.id.desc())
             .limit(1)
         )

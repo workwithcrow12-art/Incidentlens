@@ -34,11 +34,11 @@ class PagerDutyPager:
 
     @property
     def configured(self) -> bool:
-        return bool(self._key)
+        return bool(self._key and self._key.strip())
 
     async def _send(self, body: dict[str, Any]) -> DeliveryStatus:
-        if not self._key:
-            log.info("[dry-run PagerDuty] %s", body)
+        if not self.configured:
+            log.warning("[dry-run PagerDuty] PagerDuty not configured, nobody was paged: %s", body)
             return DeliveryStatus.NOT_CONFIGURED
         try:
             resp = await self._client.post(self.EVENTS_URL, json={"routing_key": self._key, **body})

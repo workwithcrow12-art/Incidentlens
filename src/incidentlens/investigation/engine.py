@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import logging
+import re
 import time
 from typing import Any
 
@@ -41,6 +42,17 @@ from incidentlens.store import Store
 log = logging.getLogger(__name__)
 
 _RANK: dict[Confidence, int] = {"high": 0, "medium": 1, "low": 2}
+_REGEX_MATCHER = re.compile(r'(=~\s*")([^"]*\{service\}[^"]*)(")')
+
+
+def render_service_query(template: str, service: str) -> str:
+    """Substitute {service} into PromQL/LogQL, escaping regex dots inside =~ matchers."""
+    escaped = service.replace(".", r"\.")
+    rendered = _REGEX_MATCHER.sub(
+        lambda m: f"{m.group(1)}{m.group(2).replace('{service}', escaped)}{m.group(3)}",
+        template,
+    )
+    return rendered.replace("{service}", service)
 
 
 @dataclass
@@ -217,7 +229,7 @@ class EvidenceEngine:
         base_start, base_end, cur_start = self._windows(target, now)
 
         async def check(signal: Signal) -> Finding | None:
-            query = signal.query.replace("{service}", target.service)
+            query = render_service_query(signal.query, target.service)
             base, cur = await asyncio.gather(
                 prom.query_range(query, base_start, base_end),
                 prom.query_range(query, cur_start, now),
@@ -247,7 +259,7 @@ class EvidenceEngine:
         loki = self._loki
         if loki is None or cfg is None or not is_safe_name(target.service):
             return []
-        query = cfg.query.replace("{service}", target.service)
+        query = render_service_query(cfg.query, target.service)
         guard = self._signals.guard_minutes * 60
         window = max(300, min(3600, int((now - target.started_at).total_seconds()) + guard))
         before_at = target.started_at - timedelta(seconds=guard + 600)

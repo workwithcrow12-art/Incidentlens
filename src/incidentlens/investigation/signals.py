@@ -50,16 +50,11 @@ class Anomaly(BaseModel):
 
 def compare(signal: Signal, baseline: list[float], current: list[float]) -> Anomaly | None:
     """Return an Anomaly when the incident window deviates significantly from the baseline window."""
-    if not current:
+    if not current or not baseline:
         return None
-    base = fmean(baseline) if baseline else 0.0
+    base = fmean(baseline)
     cur = fmean(current)
-    if signal.direction == "up":
-        big, small = cur, base
-    else:
-        if not baseline:
-            return None  # Cannot claim a drop when there is no pre-incident baseline
-        big, small = base, cur
+    big, small = (cur, base) if signal.direction == "up" else (base, cur)
     if big - small < signal.min_abs or big <= small:
         return None
     if small > 1e-12 and big / small < signal.min_ratio:

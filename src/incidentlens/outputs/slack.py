@@ -21,7 +21,9 @@ log = logging.getLogger(__name__)
 class Notifier(Protocol):
     async def send(self, text: str, blocks: list[dict[str, Any]] | None = None) -> DeliveryStatus | bool: ...
 
-    async def respond(self, response_url: str | None, text: str) -> bool: ...
+    async def respond(
+        self, response_url: str | None, text: str, blocks: list[dict[str, Any]] | None = None
+    ) -> bool: ...
 
 
 class SlackNotifier:
@@ -72,13 +74,18 @@ class SlackNotifier:
             return DeliveryStatus.FAILED
         return DeliveryStatus.NOT_CONFIGURED
 
-    async def respond(self, response_url: str | None, text: str) -> bool:
+    async def respond(
+        self, response_url: str | None, text: str, blocks: list[dict[str, Any]] | None = None
+    ) -> bool:
         """Reply to an interactive Slack button click. Only accepts official Slack hook URLs."""
         if not response_url or not response_url.startswith("https://hooks.slack.com/"):
             log.info("[interaction reply] %s", text)
             return False
+        payload: dict[str, Any] = {"text": text, "replace_original": False}
+        if blocks:
+            payload["blocks"] = blocks
         try:
-            resp = await self._client.post(response_url, json={"text": text, "replace_original": False})
+            resp = await self._client.post(response_url, json=payload)
             resp.raise_for_status()
             return True
         except httpx.HTTPError as exc:

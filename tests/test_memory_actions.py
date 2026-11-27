@@ -172,7 +172,39 @@ async def test_two_approvers_clicking_at_once_execute_only_once(tmp_path, clock,
     assert statuses == ["executed", "denied"]
 
 
-async def test_action_cooldown_blocks_repeat_until_expired(tmp_path, clock, world):
+async def test_timed_out_action_starts_cooldown_blocking_second_approver(tmp_path, clock, world):
+    attempts = 0
+
+    async def timeout_executor(argv, timeout):
+        nonlocal attempts
+        attempts += 1
+        return -1, "Timed out after 1s; process killed"
+
+    cfg = ActionsConfig(
+        actions={
+            "rollback": ActionSpec(
+                label="Rollback",
+                command=["kubectl", "rollout", "undo", "deployment/{service}"],
+                approvers=["U1", "U2"],
+                cooldown_seconds=300,
+            )
+        }
+    )
+    lens = simulated_service(tmp_path, clock, world, actions=cfg, actions_enabled=True)
+    lens.actions._executor = timeout_executor
+    await lens.handle_alerts([make_alert(starts_at=START)])
+    await lens.drain()
+
+    r1 = await lens.run_action(1, "rollback", "U1", "alice")
+    r2 = await lens.run_action(1, "rollback", "U2", "bob")
+
+    assert r1.startswith("❌")
+    assert r2.startswith("⛔") and "cooldown" in r2
+    assert attempts == 1
+    assert [a.status for a in lens.store.actions_for_incident(1)] == ["failed", "denied"]
+
+
+async def test_action_cooldown_and_same_incident_reconfirmation(tmp_path, clock, world):
     executed = []
 
     async def track_executor(argv, timeout):
@@ -196,12 +228,44 @@ async def test_action_cooldown_blocks_repeat_until_expired(tmp_path, clock, worl
 
     assert (await lens.run_action(1, "rollback", "U1", "alice")).startswith("✅")
     clock.now += timedelta(seconds=120)
-    assert (await lens.run_action(1, "rollback", "U2", "bob")).startswith("⛔")
+    assert (await lens.run_action(1, "rollback", "U2", "bob", confirm_repeat=True)).startswith("⛔")
     assert len(executed) == 1
 
+    # After 301s cooldown has expired, but repeating rollback on the same incident still requires explicit re-confirmation.
     clock.now += timedelta(seconds=181)
-    assert (await lens.run_action(1, "rollback", "U2", "bob")).startswith("✅")
+    unconfirmed = await lens.handle_interaction(
+        "act_rollback", "1:rollback", "U2", "bob", "https://hooks.slack.com/actions/T/1/x"
+    )
+    assert unconfirmed.startswith("⛔") and "re-confirmation" in unconfirmed
+    assert len(executed) == 1
+    reply = world.slack[-1]
+    reconfirm_btn = next(
+        el for b in reply["blocks"] if b["type"] == "actions" for el in b["elements"]
+    )
+    assert reconfirm_btn["action_id"] == "act_confirm_rollback"
+
+    # Clicking the explicit Slack re-confirmation button executes the second rollback and starts a fresh cooldown.
+    confirmed = await lens.handle_interaction(
+        reconfirm_btn["action_id"], reconfirm_btn["value"], "U2", "bob", None
+    )
+    assert confirmed.startswith("✅")
     assert len(executed) == 2
+
+    # Even after another 301s, the old re-confirmation token cannot authorize a third rollback.
+    clock.now += timedelta(seconds=301)
+    stale_token = await lens.handle_interaction(
+        reconfirm_btn["action_id"], reconfirm_btn["value"], "U1", "alice", None
+    )
+    assert stale_token.startswith("⛔")
+    assert len(executed) == 2
+
+    # A separate future incident on the same service runs on the first click once cooldown has passed.
+    await lens.handle_alerts([make_alert(status="resolved", starts_at=START, ends_at=clock.now)])
+    clock.now += timedelta(minutes=10)
+    await lens.handle_alerts([make_alert(starts_at=clock.now)])
+    await lens.drain()
+    assert (await lens.run_action(2, "rollback", "U1", "alice")).startswith("✅")
+    assert len(executed) == 3
 
 
 async def test_action_refused_on_resolved_incident(tmp_path, clock, world):

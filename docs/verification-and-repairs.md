@@ -4,6 +4,22 @@
 
 Every defect below was reproduced with a failing regression test first and verified after applying the fix.
 
+### Third review round (2026-11-26)
+
+| ID | Repaired behavior | Regression coverage |
+| --- | --- | --- |
+| R17 | Postmortem files track the SHA-256 of the last system-generated draft (`postmortem_sha256:{id}`). Adding `root_cause`/`fix`, recording hypothesis feedback, or finishing a late investigation regenerates unedited postmortem files and serves fresh `GET /incidents/{id}/postmortem` content, while manual file edits on disk are never overwritten. | `test_postmortem_regenerates_on_post_recovery_updates_until_manually_edited`, `test_get_postmortem_is_read_only_and_preserves_manual_edits` |
+| R18 | Missing `IL_PAGERDUTY_ROUTING_KEY` emits a `WARNING` at application startup, logs dry-run PagerDuty calls at `WARNING`, and appends `⚠️ PagerDuty not configured, nobody was paged` to critical and auto-escalated Slack alerts without queuing false retries. | `test_unconfigured_pagerduty_is_not_treated_as_failure_or_queued`, `test_startup_does_not_warn_when_pagerduty_is_configured`, `test_pagerduty_trigger_resolve_and_dry_run` |
+| R19 | Per-service `cooldown_seconds` applies to any attempted execution (`executed` or `failed`, including command timeouts), and repeating an already-attempted action on the same incident requires explicit single-use re-confirmation (`act_confirm_<action>`). | `test_timed_out_action_starts_cooldown_blocking_second_approver`, `test_action_cooldown_and_same_incident_reconfirmation`, `test_fresh_signed_action_respects_cooldown_and_requires_reconfirm` |
+| R20 | Redaction covers `DB_PASS=…`, CLI flags (`--password …`, `--token …`), `sk-ant-…` / `sk-proj-…` API keys, URL passwords containing `/` or `@`, and `Authorization: Token …` (keeping `Token` while redacting the secret), while preserving operational counters (`token_count=15`, `max_tokens: 1000`). | `tests/test_redact.py` |
+| R21 | Alert batches group by fingerprint to preserve per-alert ordering while delivering distinct fingerprints concurrently (`asyncio.gather`). | `test_alert_batch_delivers_concurrently_across_fingerprints` |
+| R22 | Scheduled background jobs run immediately when due and persist `schedule:<name>` timestamps in `kv` so process restarts preserve remaining timer intervals instead of resetting them. | `test_scheduled_jobs_run_immediately_and_preserve_timer_across_restarts` |
+| R23 | Empty or unset `IL_WEBHOOK_TOKEN` fails closed (`401`) unless `IL_ALLOW_UNAUTHENTICATED=true` is explicitly set; `docker-compose.yml` binds `127.0.0.1:8000:8000` by default and requires a non-empty `IL_WEBHOOK_TOKEN`. | `test_empty_or_unset_webhook_token_fails_closed`, `test_compose_binds_loopback_and_requires_webhook_token` |
+| R24 | Missing Prometheus baseline samples (`[]`) return `None` instead of counting as `0.0`, while measured zero baselines (`[0.0, ...]`) still detect anomalies. | `test_appears_from_zero_requires_measured_baseline`, `test_missing_prometheus_baseline_creates_no_false_evidence` |
+| R25 | Pod PromQL templates match controller pod suffixes (`{service}-([a-z0-9]{8,10}-[a-z0-9]{5}|[0-9]+)`) and escape dots inside regex matchers so sibling services (`{service}-worker`, `{service}-service`) cannot match. | `test_shipped_config_is_valid_and_pod_queries_do_not_match_other_services` |
+| R26 | `IncidentLens.drain()` prunes already-finished tasks (`t.done()`) before calling `asyncio.gather`, eliminating an infinite non-yielding loop on Python 3.12/Linux when a task finishes right before its `discard` callback runs; PostgreSQL `Store` engines enable `pool_pre_ping=True`. | `test_drain_does_not_spin_when_task_completes_before_discard_callback`, `test_new_episode_preserves_pending_resolution` |
+| R27 | `.env.example` keeps all comments on standalone `#` lines rather than inline after `KEY=`, preventing Docker Compose and `--env-file` parsers from treating inline comment text as literal secret/URL values (which previously bypassed `${IL_WEBHOOK_TOKEN:?}` and populated `IL_SLACK_SIGNING_SECRET`); `Settings` normalizes blank/whitespace-only optional strings to `None`. | `test_env_example_has_no_inline_comments_that_break_docker_compose` |
+
 ### Second review round (2026-11-26)
 
 | ID | Repaired behavior | Regression coverage |
@@ -36,15 +52,15 @@ Every defect below was reproduced with a failing regression test first and verif
 - Notification retries run every `IL_ESCALATION_CHECK_SECONDS` (60 seconds by default), or via `POST /escalations/check` when schedules are disabled. Unconfigured channels (`DeliveryStatus.NOT_CONFIGURED`) are not queued for retries.
 - Slack interaction replay deduplication is atomic across store instances. In addition, approved actions acquire a per-service lock, refuse resolved incidents, and enforce `cooldown_seconds` after any executed action on that service.
 
-## Local verification summary
+## Local and Docker verification summary
 
-Verified on **2026-11-26** (Windows, Python 3.14.6, SQLite):
+Verified on **2026-11-26** across local Windows and Linux Docker (`python:3.12-slim` + `pgvector/pgvector:pg16`):
 
-- **179 tests passed** with **98% statement coverage**.
+- **214 tests passed** with **98% statement coverage** on both SQLite and live PostgreSQL 16 (`pgvector/pgvector:pg16`).
 - **`mypy src scripts` passed** with zero errors across 38 files.
-- The offline lifecycle demonstration (`scripts/demo.py`) completed and generated sample digests, postmortems, and ROI reports in English.
-- Source (`sdist`) and wheel (`bdist_wheel`) distributions built cleanly.
-- Docker and live PostgreSQL were not executed locally on this host; GitHub Actions CI includes a PostgreSQL 16 integration job (`pgvector/pgvector:pg16`).
+- The offline lifecycle demonstration (`scripts/demo.py`) completed cleanly locally and inside Docker.
+- Source (`sdist`) and wheel (`bdist_wheel`) distributions built cleanly (`uv build`).
+- Production `Dockerfile` image and live `docker compose` stack (`incidentlens` + `pgvector/pgvector:pg16`) verified end-to-end: empty-token Compose guard, loopback port binding (`127.0.0.1:8000`), `401` bearer-token enforcement, `scripts/send_sample.sh`, postmortem/ROI/digest generation, Slack HMAC signature + replay deduplication, and PostgreSQL persistence across container restarts.
 
 ```bash
 python -m mypy src scripts

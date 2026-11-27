@@ -2,7 +2,7 @@
 
 IncidentLens receives infrastructure alerts, pages on-call through deterministic YAML routing rules, and investigates in the background. It correlates Prometheus metrics, Loki logs, GitHub deployments, dependency alerts, and past incidents into evidence-linked hypotheses, while batching lower-priority alerts into scheduled Markdown digests.
 
-**Status: prototype verified locally (179 tests, 98% coverage, strict `mypy`); staging validation is required before enabling live actions or production log ingestion.** See [docs/verification-and-repairs.md](docs/verification-and-repairs.md) for the full repair history and verification matrix.
+**Status: prototype verified locally and in Docker + PostgreSQL 16 (214 tests, 98% coverage, strict `mypy`); staging validation is required before enabling live actions or production log ingestion.** See [docs/verification-and-repairs.md](docs/verification-and-repairs.md) for the full repair history and verification matrix.
 
 ## How it works
 
@@ -56,7 +56,7 @@ flowchart TD
     HUMAN --> SIGNED["Signed Slack interaction"]
     SIGNED --> FEEDBACK["Hypothesis feedback"]
     FEEDBACK --> DB
-    SIGNED --> ACTION["Approver, resolved, lock, and cooldown checks"]
+    SIGNED --> ACTION["Approver, resolved, lock, cooldown, and re-confirm checks"]
     ACTION -->|enabled and authorized| CMD["Execute allowlisted command"]
     ACTION -->|disabled| DRY["Dry-run preview"]
     CMD --> AUDIT["Action audit record"]
@@ -64,15 +64,15 @@ flowchart TD
     AUDIT --> DB
 ```
 
-Routing never depends on the LLM, and the LLM has no path to command execution. Alerts with the same fingerprint are serialized; failed deliveries on configured channels are persisted and retried every `IL_ESCALATION_CHECK_SECONDS` (unconfigured channels log locally without queuing retries).
+Routing never depends on the LLM, and the LLM has no path to command execution. Alerts with the same fingerprint are serialized while distinct fingerprints in a batch process and deliver concurrently; failed deliveries on configured channels are persisted and retried every `IL_ESCALATION_CHECK_SECONDS` (unconfigured channels warn clearly without queuing retries).
 
 | Capability | Implementation | Key boundaries |
 | --- | --- | --- |
-| Alert routing | Three severities (`critical`, `action`, `info`) from YAML; age/repeat escalation | Related warnings do not jointly escalate; single-replica in-process scheduler. |
-| Investigation | Pre/during metric & log comparisons, deploy correlation, dependency & memory lookup | Zero hypotheses when evidence is absent; LLM output is validated and confidence is computed in code. |
-| Redaction | Emails, phones, Luhn cards, JWTs, Bearer/Basic auth, URL credentials, AWS/GitHub/Slack tokens, key-value secrets | Validate against organization-specific log formats before enabling external LLMs. |
-| Human actions | Signed Slack interactions, approver IDs, argument-list execution, per-service lock & cooldown | Disabled by default (`IL_ACTIONS_ENABLED=false`); refused on resolved incidents. |
-| Postmortems & ROI | Auto-drafted postmortems, read-only `GET` preview, monthly ROI & MTTR reports | Manual root causes and postmortem file edits are preserved across feedback and `GET` reads. |
+| Alert routing | Three severities (`critical`, `action`, `info`) from YAML; age/repeat escalation | Related warnings do not jointly escalate; single-replica scheduler persists last-run timestamps across restarts. |
+| Investigation | Measured pre/during metric & log comparisons, deploy correlation, dependency & memory lookup | Zero hypotheses when evidence or baseline data is absent; pod queries match workload pod suffixes only; confidence is computed in code. |
+| Redaction | Emails, phones, Luhn cards, JWTs, `Authorization` (`Bearer`/`Basic`/`Token`), URL credentials (`/` and `@`), AWS/GitHub/Slack/`sk-ant-` keys, CLI flags (`--password`), key-value secrets (`DB_PASS`) | Operational counters (`token_count`, `max_tokens`) are preserved; validate against organization-specific log formats before enabling external LLMs. |
+| Human actions | Signed Slack interactions, approver IDs, argument-list execution, per-service lock & cooldown on any attempt, explicit repeat re-confirmation | Disabled by default (`IL_ACTIONS_ENABLED=false`); refused on resolved incidents. |
+| Postmortems & ROI | Auto-drafted postmortems, read-only `GET` preview, monthly ROI & MTTR reports | Unedited postmortems regenerate when resolution notes or feedback arrive after recovery; manual file edits are preserved. |
 
 ## Quickstart
 
@@ -136,10 +136,10 @@ For a standalone PostgreSQL instance, install `.[postgres]` and set `IL_DATABASE
 | `config/routing_rules.yaml` | Alert classification and escalation thresholds. Keep an independent critical route from Alertmanager to PagerDuty during pilot validation. |
 | `config/services.yaml` | Service owners, GitHub repositories, dependencies, and runbook URLs. |
 | `config/signals.yaml` | PromQL and LogQL templates (`{service}` placeholder) tuned to your metric and label names. |
-| `config/actions.yaml`, `IL_ACTIONS_ENABLED` | Allowlisted commands, Slack approver IDs, timeouts, and per-service `cooldown_seconds`. Note: the base Docker image omits `kubectl`. |
+| `config/actions.yaml`, `IL_ACTIONS_ENABLED` | Allowlisted commands, Slack approver IDs, timeouts, per-service `cooldown_seconds`, and `confirm_repeat`. Note: the base Docker image omits `kubectl`. |
 | `config/baseline.yaml` | Pre-adoption headcount, interruption rate, and MTTR for ROI comparisons. |
-| `IL_WEBHOOK_TOKEN`, `IL_PUBLIC_URL` | Bearer authentication for API/webhook routes and public base URL for evidence links. |
-| `IL_PAGERDUTY_ROUTING_KEY` | PagerDuty Events API v2 routing key (unconfigured = local dry-run, not queued). |
+| `IL_WEBHOOK_TOKEN`, `IL_PUBLIC_URL` | Required bearer token for API/webhook routes (fails closed when empty; Docker Compose binds `127.0.0.1:8000` by default) and public base URL for evidence links. |
+| `IL_PAGERDUTY_ROUTING_KEY` | PagerDuty Events API v2 routing key (unconfigured = startup warning + Slack warning that nobody was paged, not queued). |
 | `IL_SLACK_BOT_TOKEN`, `IL_SLACK_CHANNEL`, `IL_SLACK_SIGNING_SECRET` | Slack bot delivery and signed interactivity (`POST /slack/interactions`), or `IL_SLACK_WEBHOOK_URL` for message-only delivery. |
 | `IL_PROMETHEUS_URL`, `IL_LOKI_URL`, `IL_GITHUB_TOKEN`, `IL_GRAFANA_URL` | Read-only evidence collectors and Grafana Explore deep links. |
 | `IL_LLM_PROVIDER`, `IL_LLM_MODEL`, `IL_LLM_API_KEY`, `IL_LLM_BASE_URL` | Optional hypothesis refinement (`none`, `anthropic`, or `openai-compatible`). |
@@ -148,7 +148,7 @@ Run a **single replica**: schedules, alert locks, and service action locks are p
 
 ## API reference
 
-All endpoints except `/healthz` and `/slack/interactions` require `Authorization: Bearer <IL_WEBHOOK_TOKEN>` when `IL_WEBHOOK_TOKEN` is set. `/slack/interactions` verifies Slack HMAC signatures.
+All endpoints except `/healthz` and `/slack/interactions` require `Authorization: Bearer <IL_WEBHOOK_TOKEN>` (requests are rejected with `401` when `IL_WEBHOOK_TOKEN` is unset or empty unless `IL_ALLOW_UNAUTHENTICATED=true` is explicitly set for local development). `/slack/interactions` verifies Slack HMAC signatures.
 
 | Method and path | Purpose |
 | --- | --- |
@@ -171,5 +171,5 @@ All endpoints except `/healthz` and `/slack/interactions` require `Authorization
 - `src/incidentlens/ingest/`, `routing/` — Alertmanager normalization and YAML rule evaluation
 - `src/incidentlens/investigation/`, `changes/`, `memory/` — Prometheus/Loki/GitHub collectors, anomaly detection, incident similarity, and optional LLM synthesis
 - `src/incidentlens/actions/`, `digest/`, `reports/`, `outputs/` — Guarded command runner, Markdown digests/postmortems/ROI, Slack cards, PagerDuty, and Git archive sync
-- [docs/verification-and-repairs.md](docs/verification-and-repairs.md) — Repair log (R1–R16), verification commands, and staging checklist
+- [docs/verification-and-repairs.md](docs/verification-and-repairs.md) — Repair log (R1–R27), verification commands, and staging checklist
 - [LICENSE](LICENSE) — MIT License
