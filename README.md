@@ -127,7 +127,7 @@ docker compose up -d db
 docker compose up --build incidentlens
 ```
 
-For a standalone PostgreSQL instance, install `.[postgres]` and set `IL_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/incidentlens`. Tables are created at startup; schema migrations are not yet implemented.
+For a standalone PostgreSQL instance, install `.[postgres]` and set `IL_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/incidentlens`. Tables and additive column/index upgrades run automatically at startup (back up databases before major upgrades). Docker Compose persists digests and postmortems in the `digests` named volume so UID `10001` can write on Linux; if bind-mounting a host folder instead, pre-create it with `chown 10001:10001`.
 
 ## Staging configuration
 

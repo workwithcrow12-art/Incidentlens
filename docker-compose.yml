@@ -7,7 +7,7 @@ services:
       IL_DATABASE_URL: postgresql+psycopg://incidentlens:incidentlens@db:5432/incidentlens
       IL_WEBHOOK_TOKEN: ${IL_WEBHOOK_TOKEN:?Set a non-empty IL_WEBHOOK_TOKEN in .env}
     volumes:
-      - ./digests:/app/digests
+      - digests:/app/digests
     depends_on:
       db:
         condition: service_healthy
@@ -28,4 +28,5 @@ services:
       - pgdata:/var/lib/postgresql/data
 
 volumes:
+  digests:
   pgdata:

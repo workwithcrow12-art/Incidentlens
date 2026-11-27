@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from incidentlens.actions.runner import ActionSpec
-from incidentlens.models import CONFIDENCE_LABEL, IncidentRecord, InvestigationRecord
+from incidentlens.models import CONFIDENCE_LABEL, ActionRecord, IncidentRecord, InvestigationRecord
 
 
 def esc(text: str) -> str:
@@ -34,6 +34,37 @@ def _button(text: str, action_id: str, value: str, **extra: Any) -> dict[str, An
         "value": value,
         **extra,
     }
+
+
+def _confirm(title: str, text: str, confirm: str = "Run") -> dict[str, Any]:
+    return {
+        "title": {"type": "plain_text", "text": title},
+        "text": {"type": "mrkdwn", "text": text[:290]},
+        "confirm": {"type": "plain_text", "text": confirm},
+        "deny": {"type": "plain_text", "text": "Cancel"},
+    }
+
+
+def reconfirm_blocks(
+    incident: IncidentRecord, action: str, label: str, prior: ActionRecord
+) -> list[dict[str, Any]]:
+    prompt = (
+        f"⚠️ *{esc(label)}* was already attempted on *{incident.code}* "
+        f"(`{prior.status}` at {prior.at:%H:%M:%S} UTC). "
+        f"Re-confirm only if `{esc(incident.service)}` genuinely needs another `{esc(action)}`."
+    )
+    btn = _button(
+        f"Re-confirm {label}",
+        f"act_confirm_{action}",
+        f"{incident.id}:{action}:confirm:{prior.id}",
+        style="danger",
+        confirm=_confirm(
+            "Re-confirm repeat action",
+            f"Run *{esc(label)}* again on `{esc(incident.service)}` for {incident.code}?",
+            "Run again",
+        ),
+    )
+    return [_section(prompt), {"type": "actions", "elements": [btn]}]
 
 
 def investigation_card(
@@ -110,12 +141,7 @@ def investigation_card(
                     f"act_{name}",
                     f"{incident.id}:{name}",
                     style="danger",
-                    confirm={
-                        "title": {"type": "plain_text", "text": "Confirm"},
-                        "text": {"type": "mrkdwn", "text": question[:290]},
-                        "confirm": {"type": "plain_text", "text": "Run"},
-                        "deny": {"type": "plain_text", "text": "Cancel"},
-                    },
+                    confirm=_confirm("Confirm", question),
                 )
             )
     if ops:

@@ -48,7 +48,7 @@ Every defect below was reproduced with a failing regression test first and verif
 
 ### Operational notes on persistence and retries
 
-- The database creates `notification_deliveries` and `interaction_claims` alongside existing `alerts`, `episodes`, `incidents`, `investigations`, `action_log`, and `kv` tables at startup. Schema migrations are not yet implemented; back up databases before upgrading.
+- The database creates `notification_deliveries` and `interaction_claims` alongside existing `alerts`, `episodes`, `incidents`, `investigations`, `action_log`, and `kv` tables at startup, and automatically applies additive column/index upgrades (`incidents.pager_key`, `notification_deliveries.created_at`) on pre-existing databases. Back up databases before major upgrades.
 - Notification retries run every `IL_ESCALATION_CHECK_SECONDS` (60 seconds by default), or via `POST /escalations/check` when schedules are disabled. Unconfigured channels (`DeliveryStatus.NOT_CONFIGURED`) are not queued for retries.
 - Slack interaction replay deduplication is atomic across store instances. In addition, approved actions acquire a per-service lock, refuse resolved incidents, and enforce `cooldown_seconds` after any executed action on that service.
 

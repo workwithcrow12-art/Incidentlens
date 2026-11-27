@@ -33,40 +33,35 @@ def _card(match: re.Match[str]) -> str:
 _PLACEHOLDERS = {"[REDACTED]", "[TOKEN]", "[API_KEY]", "[GITHUB_TOKEN]", "[SLACK_TOKEN]", "[JWT]", "[AWS_KEY]"}
 
 
+def _redact_userinfo(userinfo: str, host_and_path: str = "") -> str | None:
+    if ":" in userinfo:
+        user, password = userinfo.split(":", 1)
+        if "/" in user or not password or password in _PLACEHOLDERS:
+            return None
+        if re.match(r"^\d{1,5}/", password) and re.fullmatch(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", host_and_path):
+            return None
+        return f"{user}:[REDACTED]"
+    if "/" not in userinfo and userinfo and userinfo not in _PLACEHOLDERS:
+        return "[REDACTED]"
+    return None
+
+
 def _url_credentials(match: re.Match[str]) -> str:
     scheme, raw = match.group(1), match.group(2)
     trimmed = raw.rstrip("),.;]")
     suffix = raw[len(trimmed) :]
-    qpos = len(trimmed)
-    for sep in ("?", "#"):
-        idx = trimmed.find(sep)
-        if idx != -1 and idx < qpos:
-            qpos = idx
+    qpos = min((trimmed.find(s) for s in ("?", "#") if s in trimmed), default=len(trimmed))
     authority_and_path, tail = trimmed[:qpos], trimmed[qpos:]
     if "@" not in authority_and_path:
         return match.group(0)
     userinfo, host_and_path = authority_and_path.rsplit("@", 1)
-    if host_and_path:
-        if ":" in userinfo:
-            user, password = userinfo.split(":", 1)
-            if "/" not in user and password and password not in _PLACEHOLDERS:
-                if not (
-                    re.match(r"^\d{1,5}/", password)
-                    and re.fullmatch(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", host_and_path)
-                ):
-                    return f"{scheme}{user}:[REDACTED]@{host_and_path}{tail}{suffix}"
-        elif "/" not in userinfo and userinfo and userinfo not in _PLACEHOLDERS:
-            return f"{scheme}[REDACTED]@{host_and_path}{tail}{suffix}"
+    if host_and_path and (redacted := _redact_userinfo(userinfo, host_and_path)):
+        return f"{scheme}{redacted}@{host_and_path}{tail}{suffix}"
     authority, slash, rest_path = authority_and_path.partition("/")
     if "@" in authority:
         auth_user, host = authority.rsplit("@", 1)
-        if host and auth_user:
-            if ":" in auth_user:
-                user, password = auth_user.split(":", 1)
-                if password and password not in _PLACEHOLDERS:
-                    return f"{scheme}{user}:[REDACTED]@{host}{slash}{rest_path}{tail}{suffix}"
-            elif auth_user not in _PLACEHOLDERS:
-                return f"{scheme}[REDACTED]@{host}{slash}{rest_path}{tail}{suffix}"
+        if host and (redacted := _redact_userinfo(auth_user)):
+            return f"{scheme}{redacted}@{host}{slash}{rest_path}{tail}{suffix}"
     return match.group(0)
 
 
@@ -162,16 +157,14 @@ def _is_secret_key(name: str) -> bool:
 
 def _key_value(match: re.Match[str]) -> str:
     key, sep, value = match.group(1), match.group(2), match.group(3)
-    if not _is_secret_key(key) or value in ("[REDACTED]", "[TOKEN]", "[API_KEY]", "[GITHUB_TOKEN]", "[SLACK_TOKEN]"):
+    if not _is_secret_key(key) or value in _PLACEHOLDERS:
         return match.group(0)
     return f"{key}{sep}[REDACTED]"
 
 
 def _cli_flag(match: re.Match[str]) -> str:
     flag, sep, value = match.group(1), match.group(2), match.group(3)
-    if not (flag.startswith("--") or len(flag) >= 4) or not _is_secret_key(flag):
-        return match.group(0)
-    if value in ("[REDACTED]", "[TOKEN]", "[API_KEY]", "[GITHUB_TOKEN]", "[SLACK_TOKEN]"):
+    if not (flag.startswith("--") or len(flag) >= 4) or not _is_secret_key(flag) or value in _PLACEHOLDERS:
         return match.group(0)
     return f"{flag}{sep}[REDACTED]"
 

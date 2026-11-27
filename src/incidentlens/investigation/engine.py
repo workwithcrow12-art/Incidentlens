@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from incidentlens.catalog import ServiceCatalog
 from incidentlens.changes.github import ChangeProvider
@@ -204,7 +204,7 @@ class EvidenceEngine:
 
         evidence = [Evidence(id=f.id, kind=f.kind, description=f.description, url=f.url) for f in findings]
         hypotheses: list[Hypothesis] = rule_hypotheses(target, findings)
-        engine: str = "rules"
+        engine: Literal["rules", "llm"] = "rules"
         if self._synthesizer and hypotheses:
             refined = await self._synthesizer.refine(target, evidence, hypotheses)
             if refined:
@@ -215,7 +215,7 @@ class EvidenceEngine:
             hypotheses=hypotheses,
             evidence=evidence,
             similar=similar,
-            engine="llm" if engine == "llm" else "rules",
+            engine=engine,
             duration_seconds=round(time.monotonic() - t0, 3),
         )
 
@@ -275,7 +275,7 @@ class EvidenceEngine:
             loki.count(query, now, window),
             loki.count(query, before_at, window),
         )
-        if current is None or before is None or current < cfg.min_lines or current < 2 * before:
+        if current is None or before is None or current < cfg.min_lines or current <= before or current < 2 * before:
             return []
         start = now - timedelta(seconds=window)
         patterns = top_patterns(await loki.lines(query, start, now))

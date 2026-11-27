@@ -11,7 +11,23 @@ from datetime import datetime, timezone
 from threading import Lock, RLock
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, create_engine, delete, func, or_, select, update
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Engine,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    delete,
+    func,
+    inspect,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -208,6 +224,45 @@ def _action(row: ActionRow) -> ActionRecord:
     )
 
 
+def _migrate(engine: Engine) -> None:
+    """Add columns and indexes introduced in newer versions to pre-existing databases."""
+    prep = engine.dialect.identifier_preparer
+    now = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        added: set[tuple[str, str]] = set()
+        for table in Base.metadata.sorted_tables:
+            existing = {c["name"] for c in inspector.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in existing:
+                    continue
+                col_type = col.type.compile(dialect=engine.dialect)
+                conn.execute(
+                    text(f"ALTER TABLE {prep.quote(table.name)} ADD COLUMN {prep.quote(col.name)} {col_type}")
+                )
+                added.add((table.name, col.name))
+                if not col.nullable and isinstance(col.type, DateTime):
+                    conn.execute(update(table).where(table.c[col.name].is_(None)).values({col.name: now}))
+            existing_idx = {i["name"] for i in inspector.get_indexes(table.name)}
+            for idx in table.indexes:
+                if idx.name and idx.name not in existing_idx:
+                    idx.create(conn, checkfirst=True)
+        if ("incidents", "pager_key") in added:
+            for inc_id, payload in conn.execute(
+                select(DeliveryRow.incident_id, DeliveryRow.payload).where(
+                    DeliveryRow.channel == "pager",
+                    DeliveryRow.event == "open",
+                    DeliveryRow.incident_id.is_not(None),
+                )
+            ):
+                if isinstance(payload, dict) and "dedup_key" in payload:
+                    conn.execute(
+                        update(IncidentRow)
+                        .where(IncidentRow.id == inc_id, IncidentRow.pager_key.is_(None))
+                        .values(pager_key=str(payload["dedup_key"]))
+                    )
+
+
 class Store:
     def __init__(self, url: str) -> None:
         kwargs: dict[str, Any] = {}
@@ -221,6 +276,7 @@ class Store:
             kwargs["pool_pre_ping"] = True
         self._engine = create_engine(url, **kwargs)
         Base.metadata.create_all(self._engine)
+        _migrate(self._engine)
         self._session = sessionmaker(self._engine, expire_on_commit=False)
         self._claim_lock = Lock()
         self._db_lock: AbstractContextManager[Any] = RLock() if is_memory_sqlite else nullcontext()
@@ -615,6 +671,8 @@ class Store:
 
     # ---------- Action audit log ----------
 
+    _ATTEMPT_STATUSES = ("started", "executed", "failed")
+
     def start_action(
         self,
         now: datetime,
@@ -623,20 +681,7 @@ class Store:
         service: str,
         user: str,
     ) -> int:
-        with self._write() as session:
-            row = ActionRow(
-                at=as_utc(now),
-                incident_id=incident_id,
-                action=action,
-                service=service,
-                user=user,
-                status="started",
-                exit_code=None,
-                output="",
-            )
-            session.add(row)
-            session.flush()
-            return row.id
+        return self.log_action(now, incident_id, action, service, user, "started", None, "")
 
     def finish_action(
         self,
@@ -663,30 +708,31 @@ class Store:
         status: str,
         exit_code: int | None,
         output: str,
-    ) -> None:
+    ) -> int:
         with self._write() as session:
-            session.add(
-                ActionRow(
-                    at=as_utc(now),
-                    incident_id=incident_id,
-                    action=action,
-                    service=service,
-                    user=user,
-                    status=status,
-                    exit_code=exit_code,
-                    output=output,
-                )
+            row = ActionRow(
+                at=as_utc(now),
+                incident_id=incident_id,
+                action=action,
+                service=service,
+                user=user,
+                status=status,
+                exit_code=exit_code,
+                output=output,
             )
+            session.add(row)
+            session.flush()
+            return row.id
 
     def actions_for_incident(self, incident_id: int) -> list[ActionRecord]:
         stmt = select(ActionRow).where(ActionRow.incident_id == incident_id).order_by(ActionRow.at, ActionRow.id)
         with self._read() as session:
             return [_action(r) for r in session.scalars(stmt)]
 
-    def last_attempted_action(self, service: str) -> ActionRecord | None:
+    def _latest_attempt(self, *predicates: Any) -> ActionRecord | None:
         stmt = (
             select(ActionRow)
-            .where(ActionRow.service == service, ActionRow.status.in_(["started", "executed", "failed"]))
+            .where(*predicates, ActionRow.status.in_(self._ATTEMPT_STATUSES))
             .order_by(ActionRow.at.desc(), ActionRow.id.desc())
             .limit(1)
         )
@@ -694,20 +740,11 @@ class Store:
             row = session.scalars(stmt).first()
             return _action(row) if row else None
 
+    def last_attempted_action(self, service: str) -> ActionRecord | None:
+        return self._latest_attempt(ActionRow.service == service)
+
     def last_incident_attempt(self, incident_id: int, action: str) -> ActionRecord | None:
-        stmt = (
-            select(ActionRow)
-            .where(
-                ActionRow.incident_id == incident_id,
-                ActionRow.action == action,
-                ActionRow.status.in_(["started", "executed", "failed"]),
-            )
-            .order_by(ActionRow.at.desc(), ActionRow.id.desc())
-            .limit(1)
-        )
-        with self._read() as session:
-            row = session.scalars(stmt).first()
-            return _action(row) if row else None
+        return self._latest_attempt(ActionRow.incident_id == incident_id, ActionRow.action == action)
 
     # ---------- Key-value state and retention ----------
 

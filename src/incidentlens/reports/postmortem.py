@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from incidentlens.markdown import md_code, md_text, md_url
+from incidentlens.markdown import md_code, md_link, md_text
 from incidentlens.models import CONFIDENCE_LABEL, ActionRecord, IncidentRecord, InvestigationRecord
 
 _TODO = "_To be determined — owner review required._"
@@ -70,11 +70,8 @@ def render_postmortem(
             lines.append(f"\n_👎 {md_text(rec.feedback_by or '')} marked: none of the hypotheses were correct._")
         lines += ["", "### Evidence"]
         for e in inv.evidence:
-            if e.id not in cited:
-                continue
-            safe_url = md_url(e.url)
-            desc = md_text(e.description)
-            lines.append(f"- **{e.id}** [{desc}]({safe_url})" if safe_url else f"- **{e.id}** {desc}")
+            if e.id in cited:
+                lines.append(f"- **{e.id}** {md_link(e.description, e.url)}")
 
     lines += [
         "",

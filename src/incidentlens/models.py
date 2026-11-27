@@ -68,14 +68,9 @@ class Alert(BaseModel):
     ends_at: datetime | None = None
     source_url: str | None = None
 
-    @field_validator("starts_at")
+    @field_validator("starts_at", "ends_at")
     @classmethod
-    def _utc_required(cls, value: datetime) -> datetime:
-        return as_utc(value)
-
-    @field_validator("ends_at")
-    @classmethod
-    def _utc_optional(cls, value: datetime | None) -> datetime | None:
+    def _to_utc(cls, value: datetime | None) -> datetime | None:
         return as_utc(value)
 
     @property

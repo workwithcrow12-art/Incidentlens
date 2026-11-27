@@ -24,12 +24,6 @@ class NoChanges:
         return []
 
 
-def _was_deployed(statuses: list[dict[str, Any]]) -> bool:
-    """Return True if the deployment's latest non-superseded status is `success`."""
-    effective = next((s.get("state") for s in statuses if s.get("state") != "inactive"), None)
-    return effective == "success"
-
-
 class GitHubChangeProvider:
     API = "https://api.github.com"
 
@@ -59,7 +53,9 @@ class GitHubChangeProvider:
         )
         resp.raise_for_status()
         body = resp.json()
-        return isinstance(body, list) and _was_deployed(body)
+        if not isinstance(body, list):
+            return False
+        return next((s.get("state") for s in body if s.get("state") != "inactive"), None) == "success"
 
     async def recent_changes(self, service: str, since: datetime) -> list[Change]:
         info = self._catalog.get(service)

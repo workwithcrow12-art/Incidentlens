@@ -138,6 +138,8 @@ def test_compose_binds_loopback_and_requires_webhook_token():
     svc = compose["services"]["incidentlens"]
     assert svc["ports"] == ["${IL_BIND_HOST:-127.0.0.1}:8000:8000"]
     assert svc["environment"]["IL_WEBHOOK_TOKEN"].startswith("${IL_WEBHOOK_TOKEN:?")
+    assert svc["volumes"] == ["digests:/app/digests"]
+    assert "digests" in compose["volumes"]
 
 
 def test_env_example_has_no_inline_comments_that_break_docker_compose(tmp_path):

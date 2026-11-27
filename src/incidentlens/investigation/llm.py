@@ -137,21 +137,18 @@ class Synthesizer:
                 statement = redact(item.statement.strip())[: self._max_statement]
                 if not ids or not statement:
                     continue  # Never emit a hypothesis without real collected evidence
+                key = CONFIDENCE_STRENGTH.__getitem__
                 raw_conf = confidence_for({kinds[i] for i in ids})
-                supported: Confidence = "low"
-                for d in draft:
-                    shared = set(ids) & set(d.evidence_ids)
-                    if not shared:
-                        continue
-                    from_draft = confidence_for({kinds[i] for i in shared if i in kinds})
-                    bounded = (
-                        from_draft
-                        if CONFIDENCE_STRENGTH[from_draft] <= CONFIDENCE_STRENGTH[d.confidence]
-                        else d.confidence
-                    )
-                    if CONFIDENCE_STRENGTH[bounded] > CONFIDENCE_STRENGTH[supported]:
-                        supported = bounded
-                confidence = raw_conf if CONFIDENCE_STRENGTH[raw_conf] <= CONFIDENCE_STRENGTH[supported] else supported
+                supported: Confidence = max(
+                    (
+                        min(confidence_for({kinds[i] for i in shared}), d.confidence, key=key)
+                        for d in draft
+                        if (shared := set(ids) & set(d.evidence_ids))
+                    ),
+                    key=key,
+                    default="low",
+                )
+                confidence = min(raw_conf, supported, key=key)
                 result.append(
                     Hypothesis(
                         statement=statement,

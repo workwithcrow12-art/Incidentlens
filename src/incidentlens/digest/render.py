@@ -4,18 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from incidentlens.markdown import md_code, md_text, md_url
+from incidentlens.markdown import md_code, md_link, md_text, md_url
 from incidentlens.models import CONFIDENCE_LABEL, AlertGroup
 
 
 def _time(dt: datetime, ref: datetime) -> str:
     return dt.strftime("%H:%M") if dt.date() == ref.date() else dt.strftime("%m-%d %H:%M")
-
-
-def _evidence_item(description: str, url: str) -> str:
-    desc = md_text(description)
-    safe = md_url(url)
-    return f"[{desc}]({safe})" if safe else desc
 
 
 def _render_incident(index: int, inc: AlertGroup, ref: datetime) -> list[str]:
@@ -40,7 +34,7 @@ def _render_incident(index: int, inc: AlertGroup, ref: datetime) -> list[str]:
             lines.append(f"  - {md_text(ch.kind)} {ref_text}{who} at {_time(ch.created_at, ref)}")
     if inc.investigation and inc.investigation.hypotheses:
         top = inc.investigation.hypotheses[0]
-        links = " · ".join(_evidence_item(e.description, e.url) for e in inc.investigation.evidence_for(top))
+        links = " · ".join(md_link(e.description, e.url) for e in inc.investigation.evidence_for(top))
         lines.append(f"- **Hypothesis [{CONFIDENCE_LABEL[top.confidence]}]:** {md_text(top.statement)}")
         lines.append(f"  - Evidence: {links}")
     safe_source = md_url(inc.source_url)

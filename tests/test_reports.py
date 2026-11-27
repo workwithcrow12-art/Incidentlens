@@ -210,3 +210,59 @@ async def test_postmortem_for_unresolved_incident(lens):
     text = lens.write_postmortem(1).read_text(encoding="utf-8")
     assert "unresolved" in text and "To be determined" in text
     assert "### System hypotheses" in text
+
+
+def test_legacy_database_upgrades_missing_columns_on_startup(tmp_path):
+    import sqlite3
+    from incidentlens.store import Store
+
+    db_file = tmp_path / "legacy.db"
+    with sqlite3.connect(db_file) as conn:
+        # Pre-upgrade schema lacking incidents.pager_key and notification_deliveries.created_at
+        conn.executescript(
+            """
+            CREATE TABLE incidents (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                fingerprint VARCHAR(128) NOT NULL,
+                service VARCHAR(255) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                summary TEXT NOT NULL,
+                labels JSON NOT NULL,
+                origin VARCHAR(16) NOT NULL,
+                started_at DATETIME NOT NULL,
+                opened_at DATETIME NOT NULL,
+                resolved_at DATETIME,
+                root_cause TEXT,
+                fix TEXT
+            );
+            CREATE TABLE notification_deliveries (
+                key VARCHAR(255) NOT NULL PRIMARY KEY,
+                fingerprint VARCHAR(128) NOT NULL,
+                incident_id INTEGER,
+                channel VARCHAR(16) NOT NULL,
+                event VARCHAR(16) NOT NULL,
+                payload JSON NOT NULL,
+                done BOOLEAN NOT NULL
+            );
+            INSERT INTO incidents (
+                id, fingerprint, service, name, summary, labels, origin, started_at, opened_at, resolved_at
+            )
+            VALUES (1, 'fp-legacy', 'auth-service', 'HighLatency', 'slow', '{}', 'critical',
+                    '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00', '2026-10-01T00:20:00+00:00');
+            INSERT INTO notification_deliveries (key, fingerprint, incident_id, channel, event, payload, done)
+            VALUES ('incident:1:open:pager', 'fp-legacy', 1, 'pager', 'open',
+                    '{"dedup_key": "fp-legacy:incident:1"}', 1),
+                   ('orphan:done', 'fp-orphan', NULL, 'slack', 'open', '{"text": "old"}', 1),
+                   ('incident:1:resolve:slack', 'fp-legacy', NULL, 'slack', 'resolve', '{"text": "pending"}', 0);
+            """
+        )
+
+    store = Store(f"sqlite:///{db_file}")
+    inc = store.get_incident(1)
+    assert inc is not None and inc.service == "auth-service"
+    assert [d["key"] for d in store.pending_deliveries()] == ["incident:1:resolve:slack"]
+
+    # Purge removes both closed-incident deliveries and backfilled orphan deliveries, while preserving pager_key.
+    purged = store.purge(datetime(2027, 1, 1, tzinfo=timezone.utc))
+    assert purged["deliveries"] == 2
+    assert store.pager_key(inc) == "fp-legacy:incident:1"

@@ -13,8 +13,22 @@ import httpx
 from incidentlens.redact import redact
 
 
+_STREAM_RE = re.compile(r'^\s*(\{(?:[^}"`]|"(?:\\.|[^"\\])*"|`[^`]*`)*\})')
+_SERVICE_RE = re.compile(r'\bservice\s*=~?\s*(?:"(?:\\.|[^"\\])*"|`[^`]*`)')
+
+
 def _ns(dt: datetime) -> int:
     return int(dt.timestamp() * 1_000_000_000)
+
+
+def _unfiltered_selector(query: str) -> str | None:
+    s = query.strip()
+    if not (stream := _STREAM_RE.match(s)):
+        return None
+    selector = stream.group(1)
+    svc = _SERVICE_RE.search(selector)
+    base = f"{{{svc.group(0)}}}" if svc else selector
+    return base if base != s else None
 
 
 class LokiClient:
@@ -30,8 +44,7 @@ class LokiClient:
         self._grafana = grafana_url.rstrip("/") if grafana_url else None
         self._datasource = grafana_datasource
 
-    async def count(self, query: str, at: datetime, window_seconds: int) -> int | None:
-        """Return matching log line count within `window_seconds` ending at `at`, or None when empty."""
+    async def _raw_count(self, query: str, at: datetime, window_seconds: int) -> int | None:
         resp = await self._client.get(
             f"{self._base}/loki/api/v1/query",
             params={"query": f"sum(count_over_time({query}[{window_seconds}s]))", "time": _ns(at)},
@@ -42,6 +55,19 @@ class LokiClient:
             raise RuntimeError(f"Loki error: {body.get('error', 'unknown')}")
         result = body.get("data", {}).get("result", [])
         return int(float(result[0]["value"][1])) if result else None
+
+    async def count(self, query: str, at: datetime, window_seconds: int) -> int | None:
+        """Return matching log count, 0 when the service logged non-matching lines, or None if absent."""
+        matched = await self._raw_count(query, at, window_seconds)
+        if matched is not None:
+            return matched
+        # Loki returns an empty vector when a filter matches zero lines (grafana/loki#6946);
+        # check the unfiltered stream selector to distinguish zero errors from missing logs.
+        unfiltered = _unfiltered_selector(query)
+        if unfiltered is None:
+            return None
+        total = await self._raw_count(unfiltered, at, window_seconds)
+        return 0 if total and total > 0 else None
 
     async def lines(self, query: str, start: datetime, end: datetime, limit: int = 100) -> list[str]:
         resp = await self._client.get(

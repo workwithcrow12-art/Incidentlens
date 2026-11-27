@@ -101,15 +101,60 @@ async def test_missing_prometheus_baseline_creates_no_false_evidence(lens):
 
 
 async def test_missing_loki_baseline_creates_no_false_log_evidence(lens):
-    async def missing_baseline_count(query, at, window):
-        return None if at < START else 87
+    import httpx
+    from incidentlens.investigation.loki import LokiClient
+
+    def no_baseline_logs(request: httpx.Request) -> httpx.Response:
+        at = int(request.url.params.get("time", "0")) / 1e9
+        if at < START.timestamp():
+            return httpx.Response(200, json={"status": "success", "data": {"result": []}})
+        return httpx.Response(
+            200, json={"status": "success", "data": {"result": [{"metric": {}, "value": [at, "87"]}]}}
+        )
 
     lens.investigator._prometheus = None
-    lens.investigator._loki.count = missing_baseline_count
+    lens.investigator._loki = LokiClient(
+        "http://loki.test", httpx.AsyncClient(transport=httpx.MockTransport(no_baseline_logs))
+    )
     lens.investigator._changes = type("None_", (), {"recent_changes": staticmethod(lambda *a: _empty())})()
 
     inv = await lens.investigator.investigate(target())
     assert inv.evidence == [] and inv.hypotheses == []
+
+
+async def test_zero_error_baseline_reports_sudden_error_spike(tmp_path, clock):
+    import httpx
+    from incidentlens.investigation.loki import LokiClient
+
+    world = SimulatedWorld(START)
+    lens = simulated_service(tmp_path, clock, world)
+
+    def healthy_baseline_then_spike(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/loki/api/v1/query_range":
+            return world._handle(request)
+        q = request.url.params["query"]
+        at = int(request.url.params["time"]) / 1e9
+        if at < START.timestamp():
+            # Loki returns [] when no lines match the error filter (grafana/loki#6946),
+            # while the unfiltered {service="auth-service"} stream has normal INFO traffic.
+            if "|~" in q:
+                return httpx.Response(200, json={"status": "success", "data": {"result": []}})
+            return httpx.Response(
+                200, json={"status": "success", "data": {"result": [{"metric": {}, "value": [at, "240"]}]}}
+            )
+        return httpx.Response(
+            200, json={"status": "success", "data": {"result": [{"metric": {}, "value": [at, "46"]}]}}
+        )
+
+    lens.investigator._loki = LokiClient(
+        "http://loki.test", httpx.AsyncClient(transport=httpx.MockTransport(healthy_baseline_then_spike))
+    )
+    inv = await lens.investigator.investigate(target())
+    log_ev = next((e for e in inv.evidence if e.kind == "log"), None)
+    assert log_ev is not None
+    assert "46 error log lines" in log_ev.description
+    assert "pre-incident baseline: 0" in log_ev.description
+    assert inv.hypotheses[0].confidence == "high"
 
 
 @pytest.mark.parametrize("minutes_after", [1, 5, 10, 60])

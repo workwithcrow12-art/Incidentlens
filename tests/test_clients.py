@@ -82,6 +82,27 @@ async def test_loki_empty_result_returns_none_while_zero_returns_zero():
         await err.count('{service="auth-service"}', START, 300)
 
 
+async def test_loki_filtered_empty_result_distinguishes_zero_errors_from_no_logs():
+    empty_body = {"status": "success", "data": {"result": []}}
+    active_body = {"status": "success", "data": {"result": [{"metric": {}, "value": [1, "150"]}]}}
+    seen: list[str] = []
+
+    def healthy_service_handler(request: httpx.Request) -> httpx.Response:
+        q = request.url.params["query"]
+        seen.append(q)
+        # Simulates grafana/loki#6946: filtered error query returns [], unfiltered stream has 150 lines.
+        body = active_body if q == 'sum(count_over_time({service="auth-service"}[300s]))' else empty_body
+        return httpx.Response(200, json=body)
+
+    loki = LokiClient("http://loki.test", mock(healthy_service_handler))
+    assert await loki.count('{service="auth-service"} |~ "(?i)error"', START, 300) == 0
+    assert await loki.count('{service="auth-service", level="error"}', START, 300) == 0
+    assert seen.count('sum(count_over_time({service="auth-service"}[300s]))') == 2
+
+    silent = LokiClient("http://loki.test", mock(lambda r: httpx.Response(200, json=empty_body)))
+    assert await silent.count('{service="auth-service"} |~ "(?i)error"', START, 300) is None
+
+
 def test_loki_links():
     plain = LokiClient("http://loki.test", None).explore_url("{a}", START, START)
     assert plain.startswith("http://loki.test/loki/api/v1/query_range?")

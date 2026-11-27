@@ -51,3 +51,10 @@ def md_url(url: str | None) -> str | None:
     if not cleaned.lower().startswith(("http://", "https://")):
         return None
     return cleaned.translate(_URL_SPECIAL)
+
+
+def md_link(text: str, url: str | None) -> str:
+    """Render escaped inline Markdown text, linked when `url` is a safe http(s) URL."""
+    desc = md_text(text)
+    safe = md_url(url)
+    return f"[{desc}]({safe})" if safe else desc
