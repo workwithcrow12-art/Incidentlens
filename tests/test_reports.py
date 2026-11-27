@@ -1,7 +1,10 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import re
 
 from conftest import START
+from incidentlens.digest.render import render_digest
+from incidentlens.models import AlertGroup, Change, Evidence, Hypothesis, Investigation, InvestigationTarget
 from incidentlens.reports.roi import Baseline, BaselineBefore, compute_roi, render_roi
 from incidentlens.testing import SimulatedWorld, make_alert, simulated_service
 
@@ -29,15 +32,16 @@ async def test_roi_numbers(tmp_path, clock):
     assert r.days == 11 and r.headcount == 2
     assert r.episodes == 5 and r.interruptions == 1
     assert r.interruptions_now == 1 / 2 / 11
-    assert r.interruptions_before == 5 / 2 / 11 and r.interruptions_before_estimated
+    assert r.interruptions_before is None
     assert r.mttr_now == 30 and r.mttr_before is None
     assert (r.feedback_up, r.feedback_total, r.accuracy) == (1, 1, 1.0)
     assert round(r.hours_saved, 2) == 0.33
 
     text = render_roi(r)
     assert "5 alert episodes occurred; only 1 paged on-call" in text
-    assert "| -80% |" in text and "100% (1/1 rated)" in text
-    assert "Pre-adoption (estimated)" in text
+    assert "| Interruptions / responder / day | — | 0.05 | — |" in text
+    assert "100% (1/1 rated)" in text
+    assert "Pre-adoption (estimated)" not in text
 
 
 async def test_roi_with_measured_baseline(tmp_path, clock):
@@ -75,12 +79,129 @@ async def test_maintenance_publishes_last_month_once_and_purges(tmp_path, clock)
     assert (await lens.run_maintenance())["roi_report"] is None  # Published once per month
 
     lens._retention = timedelta(days=10)
+    assert lens.store.claim_interaction("old-claim", START) is True
+    assert lens.store.claim_interaction("recent-claim", clock.now) is True
     purged = (await lens.run_maintenance())["purged"]
-    assert purged["alerts"] == 1 and purged["episodes"] == 5
+    assert purged == {"alerts": 2, "episodes": 5, "interactions": 1, "deliveries": 4}
     assert lens.store.get("auth-service-Old") is None
+    assert lens.store.get("auth-service-HighLatency") is None  # Resolved critical alerts are also purged
     assert lens.store.get("auth-service-W0") is not None  # Ongoing alerts are kept
-    assert lens.store.get_incident(1) is not None  # Incident history is never purged
+    incident = lens.store.get_incident(1)
+    assert incident is not None  # Incident history is never purged
+    assert lens.store.pager_key(incident) == "auth-service-HighLatency:incident:1"  # Preserved after delivery purge
     assert lens.store.get_investigation(1) is not None
+    assert lens.store.claim_interaction("recent-claim", clock.now) is False
+
+
+async def test_purge_keeps_open_or_pending_deliveries_and_undigested_warnings(tmp_path, clock):
+    world = SimulatedWorld(START)
+    lens = simulated_service(tmp_path, clock, world)
+    # 1. Open critical incident: neither its firing alert row nor its open deliveries may be purged.
+    await lens.handle_alerts([make_alert(name="OpenCrit", fp="open-crit", starts_at=START)])
+    # 2. Resolved warning that has NOT been digested yet: must stay until digested.
+    undigested = make_alert(
+        name="UndigestedWarn", fp="undigested-warn", severity="warning", status="resolved", starts_at=START
+    )
+    await lens.handle_alerts([undigested])
+    # 3. Closed incident whose PagerDuty resolve failed (done=False): its deliveries must not be purged.
+    await lens.handle_alerts([make_alert(name="PendingClose", fp="pending-close", starts_at=START)])
+    world.fail_hosts.add("events.pagerduty.com")
+    resolved_close = make_alert(
+        name="PendingClose",
+        fp="pending-close",
+        status="resolved",
+        starts_at=START,
+        ends_at=START + timedelta(minutes=5),
+    )
+    await lens.handle_alerts([resolved_close])
+    await lens.drain()
+
+    purged = lens.store.purge(START + timedelta(days=30))
+    assert purged["alerts"] == 1  # Only pending-close's resolved critical AlertRow is purged
+    assert purged["deliveries"] == 0
+    assert lens.store.get("open-crit") is not None
+    assert lens.store.get("undigested-warn") is not None
+    open_inc = lens.store.get_incident(1)
+    pending_inc = lens.store.get_incident(2)
+    assert lens.store.pager_key(open_inc) == "open-crit:incident:1"
+    assert lens.store.pager_key(pending_inc) == "pending-close:incident:2"
+
+
+async def test_markdown_outputs_escape_injected_links_and_unsafe_urls(lens, clock):
+    malicious_summary = (
+        "Failure [Click here](https://evil.example/phish) "
+        "<https://evil.example/auto> ![img](https://evil.example/p.png)"
+    )
+    alert = make_alert(
+        name="Bad[Alert](https://evil.example/name)",
+        service="auth-service",
+        starts_at=START,
+        summary=malicious_summary,
+    ).model_copy(update={"source_url": "javascript:alert(1)"})
+    await lens.handle_alerts([alert])
+    await lens.drain()
+    lens.set_resolution(
+        1,
+        root_cause="Injected [root](https://evil.example/rc)",
+        fix="Run [script](https://evil.example/fix)",
+    )
+    pm = lens.read_postmortem(1)
+    assert "[Click here](https://evil.example/phish)" not in pm
+    assert r"\[Click here\](https://evil.example/phish)" in pm
+    assert "<https://evil.example/auto>" not in pm
+    assert "![img](https://evil.example/p.png)" not in pm
+    assert "[root](https://evil.example/rc)" not in pm
+    assert "[script](https://evil.example/fix)" not in pm
+
+    rec = lens.store.record(
+        lens.router.classify(
+            make_alert(
+                name="Warn[Inject](https://evil.example)",
+                severity="warning",
+                starts_at=START,
+                summary=malicious_summary,
+            ).model_copy(update={"source_url": "javascript:alert(1)"})
+        ),
+        START,
+    )
+    assert rec is not None
+    tgt = InvestigationTarget.from_record(rec)
+    inv = Investigation(
+        target=tgt,
+        evidence=[
+            Evidence(
+                id="E1",
+                kind="log",
+                description="log ](https://evil.example/breakout) [x",
+                url="http://grafana.test/explore?expr=rate(x[5m])",
+            )
+        ],
+        hypotheses=[
+            Hypothesis(statement="See [evil](https://evil.example/h)", confidence="medium", evidence_ids=["E1"])
+        ],
+    )
+    bad_change = Change(
+        service="svc",
+        kind="deploy",
+        ref="a1b2c3d",
+        author="[bot](https://evil.example)",
+        created_at=START,
+        url="javascript:evil()",
+    )
+    group = AlertGroup(
+        service="svc`break",
+        name=rec.name,
+        team="Team [X](https://evil.example/team)",
+        records=[rec],
+        changes=[bad_change],
+        investigation=inv,
+    )
+    digest = render_digest([group], START, START + timedelta(hours=1))
+    assert "javascript:" not in digest
+    assert not re.search(r"(?<!\\)\]\(https://evil\.example", digest)
+    assert r"\](https://evil.example/breakout)" in digest
+    assert "``svc`break``" in digest
+    assert "rate%28x%5B5m%5D%29" in digest
 
 
 async def test_postmortem_for_unresolved_incident(lens):

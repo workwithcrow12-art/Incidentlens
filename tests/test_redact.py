@@ -40,6 +40,10 @@ _SK_PROJ_SAMPLE = "sk-proj" + "-abcdef1234567890ghijklmnop"
     ("broker amqp://user:ab@cd/ef:gh@mq.internal:5672/vhost", "cd"),
     ("broker amqp://user:ab@cd/ef:gh@mq.internal:5672/vhost", "ef"),
     ("cache redis://:redis_s3cr3t@cache:6379/0 timeout", "redis_s3cr3t"),
+    ("clone https://oauth_secret_token_99@github.com/org/repo.git failed", "oauth_secret_token_99"),
+    ("push https://glpat_secret_abc123@gitlab.internal:8443/team/app", "glpat_secret_abc123"),
+    ("fetch https://tok@with_at@artifacts.internal/pkg/@scope/lib.tgz", "tok@with_at"),
+    ("bare https://solo_token_xyz@internal-host registry", "solo_token_xyz"),
     (f"github token {_GHP_SAMPLE} leaked", _GHP_SAMPLE),
     (f"fine-grained {_GHPAT_SAMPLE}", _GHPAT_SAMPLE),
     (f"slack bot {_XOXB_SAMPLE}", "aBcDeFgHiJkLmNoP"),
@@ -58,6 +62,7 @@ def test_authorization_token_scheme_preserves_scheme_and_hides_value():
     assert redact("Authorization: Token abcdef123456") == "Authorization: Token [TOKEN]"
     assert redact('{"Authorization": "Token abcdef123456"}') == '{"Authorization": "Token [TOKEN]"}'
     assert redact("dsn postgres://admin:p@ss/w0rd@db:5432/app") == "dsn postgres://admin:[REDACTED]@db:5432/app"
+    assert redact("https://MY_SECRET_TOKEN@github.com/org/repo") == "https://[REDACTED]@github.com/org/repo"
 
 
 @pytest.mark.parametrize("text", [
@@ -65,6 +70,7 @@ def test_authorization_token_scheme_preserves_scheme_and_hides_value():
     "epoch 1731400000 offset 12345",
     "pod auth-service-7d9f8b6c5-x2k4q restarted 3 times",
     "endpoint http://token-service:8080/health returned 200",
+    "package https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz ok",
     "order 1234567890123456 not a card",  # Fails Luhn checksum
     "token_count=15 and prompt_tokens=120",
     "max_tokens: 1000, completion_tokens: 250",

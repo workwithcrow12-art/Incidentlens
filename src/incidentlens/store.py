@@ -5,13 +5,15 @@ Defaults to SQLite locally and supports PostgreSQL in production. All timestamps
 
 from __future__ import annotations
 
-from datetime import datetime
-from threading import Lock
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from datetime import datetime, timezone
+from threading import Lock, RLock
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, create_engine, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from incidentlens.models import (
@@ -81,6 +83,7 @@ class IncidentRow(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(_DT, nullable=True)
     root_cause: Mapped[str | None] = mapped_column(Text, nullable=True)
     fix: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pager_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class InvestigationRow(Base):
@@ -123,7 +126,7 @@ class InteractionRow(Base):
     __tablename__ = "interaction_claims"
 
     request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    at: Mapped[datetime] = mapped_column(_DT)
+    at: Mapped[datetime] = mapped_column(_DT, index=True)
 
 
 class DeliveryRow(Base):
@@ -131,11 +134,12 @@ class DeliveryRow(Base):
 
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
     fingerprint: Mapped[str] = mapped_column(String(128), index=True)
-    incident_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    incident_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     channel: Mapped[str] = mapped_column(String(16))
     event: Mapped[str] = mapped_column(String(16))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     done: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(_DT, default=lambda: datetime.now(timezone.utc))
 
 
 def _alert(row: AlertRow) -> AlertRecord:
@@ -207,22 +211,35 @@ def _action(row: ActionRow) -> ActionRecord:
 class Store:
     def __init__(self, url: str) -> None:
         kwargs: dict[str, Any] = {}
+        is_memory_sqlite = False
         if url.startswith("sqlite"):
-            kwargs["connect_args"] = {"check_same_thread": False}
+            kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
             if ":memory:" in url or url == "sqlite://":
                 kwargs["poolclass"] = StaticPool
+                is_memory_sqlite = True
         else:
             kwargs["pool_pre_ping"] = True
         self._engine = create_engine(url, **kwargs)
         Base.metadata.create_all(self._engine)
         self._session = sessionmaker(self._engine, expire_on_commit=False)
         self._claim_lock = Lock()
+        self._db_lock: AbstractContextManager[Any] = RLock() if is_memory_sqlite else nullcontext()
+
+    @contextmanager
+    def _read(self) -> Iterator[Session]:
+        with self._db_lock, self._session() as session:
+            yield session
+
+    @contextmanager
+    def _write(self) -> Iterator[Session]:
+        with self._db_lock, self._session.begin() as session:
+            yield session
 
     def claim_interaction(self, request_id: str, now: datetime) -> bool:
         # The unique key also arbitrates requests made through separate Store instances.
         with self._claim_lock:
             try:
-                with self._session.begin() as session:
+                with self._write() as session:
                     session.add(InteractionRow(request_id=request_id, at=as_utc(now)))
                 return True
             except IntegrityError:
@@ -237,8 +254,14 @@ class Store:
         event: str,
         payload: dict[str, Any],
         repeat: bool = False,
+        now: datetime | None = None,
     ) -> None:
-        with self._session.begin() as session:
+        created = as_utc(now) if now is not None else datetime.now(timezone.utc)
+        with self._write() as session:
+            if channel == "pager" and event == "open" and incident_id is not None and "dedup_key" in payload:
+                inc = session.get(IncidentRow, incident_id)
+                if inc is not None:
+                    inc.pager_key = str(payload["dedup_key"])
             row = session.get(DeliveryRow, key)
             if row is None:
                 session.add(
@@ -250,6 +273,7 @@ class Store:
                         event=event,
                         payload=payload,
                         done=False,
+                        created_at=created,
                     )
                 )
             elif repeat:
@@ -260,7 +284,7 @@ class Store:
         stmt = select(DeliveryRow).where(DeliveryRow.done.is_(False))
         if fingerprint is not None:
             stmt = stmt.where(DeliveryRow.fingerprint == fingerprint)
-        with self._session() as session:
+        with self._read() as session:
             rows = list(session.scalars(stmt).all())
             # PagerDuty goes first so a failed trigger can make the Slack message loud.
             rows.sort(key=lambda r: (r.channel != "pager", r.key))
@@ -277,20 +301,25 @@ class Store:
             ]
 
     def finish_delivery(self, key: str) -> None:
-        with self._session.begin() as session:
+        with self._write() as session:
             session.execute(update(DeliveryRow).where(DeliveryRow.key == key).values(done=True))
 
     def pager_key(self, incident: IncidentRecord) -> str:
-        with self._session() as session:
+        with self._read() as session:
             row = session.get(DeliveryRow, f"incident:{incident.id}:open:pager")
+            if row is not None:
+                return str(row.payload["dedup_key"])
+            inc = session.get(IncidentRow, incident.id)
+            if inc is not None and inc.pager_key:
+                return inc.pager_key
             # Incidents created before delivery tracking or without PagerDuty use the bare fingerprint.
-            return str(row.payload["dedup_key"]) if row else incident.fingerprint
+            return incident.fingerprint
 
     def cancel_deliveries(self, fingerprint: str, event: str | None = None) -> None:
         stmt = update(DeliveryRow).where(DeliveryRow.fingerprint == fingerprint)
         if event is not None:
             stmt = stmt.where(DeliveryRow.event == event)
-        with self._session.begin() as session:
+        with self._write() as session:
             session.execute(stmt.values(done=True))
 
     # ---------- Alerts ----------
@@ -301,7 +330,7 @@ class Store:
         now = as_utc(now)
         # Anchor episodes on the actual onset timestamp (startsAt), capped at receipt time.
         started = min(alert.starts_at, now)
-        with self._session.begin() as session:
+        with self._write() as session:
             row = session.get(AlertRow, alert.fingerprint)
             is_new = row is None
             if row is not None:
@@ -352,13 +381,13 @@ class Store:
             return _alert(row)
 
     def get(self, fingerprint: str) -> AlertRecord | None:
-        with self._session() as session:
+        with self._read() as session:
             row = session.get(AlertRow, fingerprint)
             return _alert(row) if row else None
 
     def firing_alerts(self, service: str) -> list[AlertRecord]:
         stmt = select(AlertRow).where(AlertRow.service == service, AlertRow.status == "firing")
-        with self._session() as session:
+        with self._read() as session:
             return [_alert(r) for r in session.scalars(stmt)]
 
     def pending_for_digest(self) -> list[AlertRecord]:
@@ -369,17 +398,11 @@ class Store:
             .where(or_(AlertRow.digested.is_(False), AlertRow.status == "firing"))
             .order_by(AlertRow.first_seen)
         )
-        with self._session() as session:
+        with self._read() as session:
             return [_alert(r) for r in session.scalars(stmt)]
 
-    def mark_digested(self, fingerprints: list[str]) -> None:
-        if not fingerprints:
-            return
-        with self._session.begin() as session:
-            session.execute(update(AlertRow).where(AlertRow.fingerprint.in_(fingerprints)).values(digested=True))
-
     def mark_digest_snapshot(self, records: list[AlertRecord]) -> None:
-        with self._session.begin() as session:
+        with self._write() as session:
             for record in records:
                 session.execute(
                     update(AlertRow)
@@ -397,11 +420,11 @@ class Store:
         stmt = select(AlertRow).where(
             AlertRow.severity == Severity.ACTION.value, AlertRow.status == "firing", AlertRow.escalated.is_(False)
         )
-        with self._session() as session:
+        with self._read() as session:
             return [_alert(r) for r in session.scalars(stmt)]
 
     def mark_escalated(self, fingerprint: str, now: datetime) -> None:
-        with self._session.begin() as session:
+        with self._write() as session:
             session.execute(
                 update(AlertRow)
                 .where(AlertRow.fingerprint == fingerprint)
@@ -411,7 +434,7 @@ class Store:
     # ---------- Alert episodes (ROI) ----------
 
     def log_episode(self, record: AlertRecord, now: datetime) -> None:
-        with self._session.begin() as session:
+        with self._write() as session:
             session.add(
                 EpisodeRow(
                     at=as_utc(now),
@@ -427,14 +450,14 @@ class Store:
             .select_from(EpisodeRow)
             .where(EpisodeRow.at >= as_utc(start), EpisodeRow.at < as_utc(end))
         )
-        with self._session() as session:
+        with self._read() as session:
             return int(session.scalar(stmt) or 0)
 
     # ---------- Incidents ----------
 
     def open_incident(self, record: AlertRecord, origin: str, now: datetime) -> tuple[IncidentRecord, bool]:
         """Open an incident for an alert, or return the existing open incident (created=False)."""
-        with self._session.begin() as session:
+        with self._write() as session:
             row = session.scalars(
                 select(IncidentRow).where(
                     IncidentRow.fingerprint == record.fingerprint, IncidentRow.resolved_at.is_(None)
@@ -457,7 +480,7 @@ class Store:
             return _incident(row), True
 
     def close_incident(self, fingerprint: str, resolved_at: datetime) -> IncidentRecord | None:
-        with self._session.begin() as session:
+        with self._write() as session:
             row = session.scalars(
                 select(IncidentRow).where(IncidentRow.fingerprint == fingerprint, IncidentRow.resolved_at.is_(None))
             ).first()
@@ -468,12 +491,12 @@ class Store:
             return _incident(row)
 
     def get_incident(self, incident_id: int) -> IncidentRecord | None:
-        with self._session() as session:
+        with self._read() as session:
             row = session.get(IncidentRow, incident_id)
             return _incident(row) if row else None
 
     def episode_incident(self, fingerprint: str, started_at: datetime) -> IncidentRecord | None:
-        with self._session() as session:
+        with self._read() as session:
             row = session.scalars(
                 select(IncidentRow)
                 .where(IncidentRow.fingerprint == fingerprint, IncidentRow.started_at == as_utc(started_at))
@@ -483,7 +506,7 @@ class Store:
 
     def list_incidents(self, limit: int = 50) -> list[IncidentRecord]:
         stmt = select(IncidentRow).order_by(IncidentRow.opened_at.desc()).limit(limit)
-        with self._session() as session:
+        with self._read() as session:
             return [_incident(r) for r in session.scalars(stmt)]
 
     def closed_incidents(self, limit: int = 500) -> list[IncidentRecord]:
@@ -493,12 +516,12 @@ class Store:
             .order_by(IncidentRow.resolved_at.desc())
             .limit(limit)
         )
-        with self._session() as session:
+        with self._read() as session:
             return [_incident(r) for r in session.scalars(stmt)]
 
     def incidents_between(self, start: datetime, end: datetime) -> list[IncidentRecord]:
         stmt = select(IncidentRow).where(IncidentRow.opened_at >= as_utc(start), IncidentRow.opened_at < as_utc(end))
-        with self._session() as session:
+        with self._read() as session:
             return [_incident(r) for r in session.scalars(stmt)]
 
     def set_resolution(
@@ -508,7 +531,7 @@ class Store:
         fix: str | None = None,
         only_if_empty: bool = False,
     ) -> IncidentRecord | None:
-        with self._session.begin() as session:
+        with self._write() as session:
             row = session.get(IncidentRow, incident_id)
             if row is None:
                 return None
@@ -526,7 +549,7 @@ class Store:
         self, incident_id: int, investigation_id: int, root_cause: str | None
     ) -> IncidentRecord | None:
         marker_key = f"auto_root_cause:{incident_id}"
-        with self._session.begin() as session:
+        with self._write() as session:
             row = session.get(IncidentRow, incident_id)
             if row is None:
                 return None
@@ -549,7 +572,7 @@ class Store:
     def save_investigation(
         self, investigation: Investigation, incident_id: int | None, now: datetime
     ) -> InvestigationRecord:
-        with self._session.begin() as session:
+        with self._write() as session:
             row = InvestigationRow(
                 incident_id=incident_id,
                 created_at=as_utc(now),
@@ -560,7 +583,7 @@ class Store:
             return _investigation(row)
 
     def get_investigation(self, investigation_id: int) -> InvestigationRecord | None:
-        with self._session() as session:
+        with self._read() as session:
             row = session.get(InvestigationRow, investigation_id)
             return _investigation(row) if row else None
 
@@ -570,20 +593,20 @@ class Store:
             .where(InvestigationRow.incident_id == incident_id)
             .order_by(InvestigationRow.created_at)
         )
-        with self._session() as session:
+        with self._read() as session:
             return [_investigation(r) for r in session.scalars(stmt)]
 
     def investigations_between(self, start: datetime, end: datetime) -> list[InvestigationRecord]:
         stmt = select(InvestigationRow).where(
             InvestigationRow.created_at >= as_utc(start), InvestigationRow.created_at < as_utc(end)
         )
-        with self._session() as session:
+        with self._read() as session:
             return [_investigation(r) for r in session.scalars(stmt)]
 
     def set_feedback(
         self, investigation_id: int, verdict: str, hypothesis: int | None, user: str, now: datetime
     ) -> None:
-        with self._session.begin() as session:
+        with self._write() as session:
             session.execute(
                 update(InvestigationRow)
                 .where(InvestigationRow.id == investigation_id)
@@ -591,6 +614,44 @@ class Store:
             )
 
     # ---------- Action audit log ----------
+
+    def start_action(
+        self,
+        now: datetime,
+        incident_id: int,
+        action: str,
+        service: str,
+        user: str,
+    ) -> int:
+        with self._write() as session:
+            row = ActionRow(
+                at=as_utc(now),
+                incident_id=incident_id,
+                action=action,
+                service=service,
+                user=user,
+                status="started",
+                exit_code=None,
+                output="",
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def finish_action(
+        self,
+        action_id: int,
+        now: datetime,
+        status: str,
+        exit_code: int | None,
+        output: str,
+    ) -> None:
+        with self._write() as session:
+            session.execute(
+                update(ActionRow)
+                .where(ActionRow.id == action_id)
+                .values(at=as_utc(now), status=status, exit_code=exit_code, output=output)
+            )
 
     def log_action(
         self,
@@ -603,7 +664,7 @@ class Store:
         exit_code: int | None,
         output: str,
     ) -> None:
-        with self._session.begin() as session:
+        with self._write() as session:
             session.add(
                 ActionRow(
                     at=as_utc(now),
@@ -618,18 +679,18 @@ class Store:
             )
 
     def actions_for_incident(self, incident_id: int) -> list[ActionRecord]:
-        stmt = select(ActionRow).where(ActionRow.incident_id == incident_id).order_by(ActionRow.at)
-        with self._session() as session:
+        stmt = select(ActionRow).where(ActionRow.incident_id == incident_id).order_by(ActionRow.at, ActionRow.id)
+        with self._read() as session:
             return [_action(r) for r in session.scalars(stmt)]
 
     def last_attempted_action(self, service: str) -> ActionRecord | None:
         stmt = (
             select(ActionRow)
-            .where(ActionRow.service == service, ActionRow.status.in_(["executed", "failed"]))
+            .where(ActionRow.service == service, ActionRow.status.in_(["started", "executed", "failed"]))
             .order_by(ActionRow.at.desc(), ActionRow.id.desc())
             .limit(1)
         )
-        with self._session() as session:
+        with self._read() as session:
             row = session.scalars(stmt).first()
             return _action(row) if row else None
 
@@ -639,24 +700,24 @@ class Store:
             .where(
                 ActionRow.incident_id == incident_id,
                 ActionRow.action == action,
-                ActionRow.status.in_(["executed", "failed"]),
+                ActionRow.status.in_(["started", "executed", "failed"]),
             )
             .order_by(ActionRow.at.desc(), ActionRow.id.desc())
             .limit(1)
         )
-        with self._session() as session:
+        with self._read() as session:
             row = session.scalars(stmt).first()
             return _action(row) if row else None
 
     # ---------- Key-value state and retention ----------
 
     def kv_get(self, key: str) -> str | None:
-        with self._session() as session:
+        with self._read() as session:
             row = session.get(KVRow, key)
             return row.value if row else None
 
     def kv_set(self, key: str, value: str) -> None:
-        with self._session.begin() as session:
+        with self._write() as session:
             row = session.get(KVRow, key)
             if row is None:
                 session.add(KVRow(key=key, value=value))
@@ -664,19 +725,44 @@ class Store:
                 row.value = value
 
     def purge(self, before: datetime) -> dict[str, int]:
-        """Purge resolved+digested alerts and episode counters older than `before`.
+        """Purge old resolved alerts, episode counters, interaction claims, and finished deliveries.
 
         Incidents, investigations, and action audit logs are retained as historical memory and audit trail.
         """
         before = as_utc(before)
-        with self._session.begin() as session:
+        closed_old_incidents = select(IncidentRow.id).where(
+            IncidentRow.resolved_at.is_not(None),
+            IncidentRow.resolved_at < before,
+        )
+        incidents_with_pending = select(DeliveryRow.incident_id).where(
+            DeliveryRow.incident_id.is_not(None),
+            DeliveryRow.done.is_(False),
+        )
+        with self._write() as session:
             alerts = session.execute(
                 delete(AlertRow).where(
-                    AlertRow.status == "resolved", AlertRow.digested.is_(True), AlertRow.last_seen < before
+                    AlertRow.status == "resolved",
+                    or_(AlertRow.digested.is_(True), AlertRow.severity == Severity.CRITICAL.value),
+                    AlertRow.last_seen < before,
                 )
             )
             episodes = session.execute(delete(EpisodeRow).where(EpisodeRow.at < before))
+            interactions = session.execute(delete(InteractionRow).where(InteractionRow.at < before))
+            deliveries = session.execute(
+                delete(DeliveryRow).where(
+                    DeliveryRow.done.is_(True),
+                    or_(
+                        (
+                            DeliveryRow.incident_id.in_(closed_old_incidents)
+                            & ~DeliveryRow.incident_id.in_(incidents_with_pending)
+                        ),
+                        (DeliveryRow.incident_id.is_(None) & (DeliveryRow.created_at < before)),
+                    ),
+                )
+            )
             return {
                 "alerts": int(getattr(alerts, "rowcount", 0) or 0),
                 "episodes": int(getattr(episodes, "rowcount", 0) or 0),
+                "interactions": int(getattr(interactions, "rowcount", 0) or 0),
+                "deliveries": int(getattr(deliveries, "rowcount", 0) or 0),
             }

@@ -67,7 +67,7 @@ async def _exec(argv: list[str], timeout: int) -> tuple[int, str]:
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         return -1, f"Timed out after {timeout}s; process killed"
@@ -84,6 +84,10 @@ class ActionRunner:
         self._config = config or ActionsConfig()
         self._enabled = enabled
         self._executor = executor
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
 
     def available_for(self, service: str) -> list[tuple[str, ActionSpec]]:
         if not is_safe_name(service):

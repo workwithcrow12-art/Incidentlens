@@ -112,7 +112,7 @@ async def _every(
     now_fn = clock or (lambda: datetime.now(timezone.utc))
     delay = 0.0
     if store is not None and name is not None:
-        last = store.kv_get(f"schedule:{name}")
+        last = await asyncio.to_thread(store.kv_get, f"schedule:{name}")
         if last is not None:
             elapsed = (now_fn() - as_utc(datetime.fromisoformat(last))).total_seconds()
             delay = max(0.0, seconds - elapsed)
@@ -122,7 +122,7 @@ async def _every(
         try:
             await job()
             if store is not None and name is not None:
-                store.kv_set(f"schedule:{name}", now_fn().isoformat())
+                await asyncio.to_thread(store.kv_set, f"schedule:{name}", now_fn().isoformat())
         except Exception:
             log.exception("Scheduled background job failed")
         await asyncio.sleep(seconds)
@@ -148,10 +148,10 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
         svc_instance = service
         if svc_instance is None:
             http = httpx.AsyncClient(timeout=10)
-            svc_instance = build_service(cfg, http)
+            svc_instance = await asyncio.to_thread(build_service, cfg, http)
         app.state.service = svc_instance
 
-        if not svc_instance._pager_configured():
+        if not svc_instance.pager_configured:
             log.warning("PagerDuty not configured (IL_PAGERDUTY_ROUTING_KEY is empty); nobody will be paged")
         if not (cfg.webhook_token or "").strip() and not cfg.allow_unauthenticated:
             log.warning("IL_WEBHOOK_TOKEN is not configured; protected API endpoints will reject requests")
@@ -165,7 +165,7 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
                         svc_instance.check_escalations,
                         store=svc_instance.store,
                         name="escalations",
-                        clock=svc_instance._clock,
+                        clock=svc_instance.clock,
                     )
                 ),
                 asyncio.create_task(
@@ -174,7 +174,7 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
                         svc_instance.run_digest,
                         store=svc_instance.store,
                         name="digest",
-                        clock=svc_instance._clock,
+                        clock=svc_instance.clock,
                     )
                 ),
                 asyncio.create_task(
@@ -183,7 +183,7 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
                         svc_instance.run_maintenance,
                         store=svc_instance.store,
                         name="maintenance",
-                        clock=svc_instance._clock,
+                        clock=svc_instance.clock,
                     )
                 ),
             ]
@@ -242,36 +242,44 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
 
     @app.get("/alerts/{fingerprint}", dependencies=auth)
     async def get_alert(fingerprint: str, request: Request) -> dict[str, Any]:
-        record = svc(request).store.get(fingerprint)
+        record = await asyncio.to_thread(svc(request).store.get, fingerprint)
         if record is None:
             raise HTTPException(status_code=404, detail="Alert not found")
         return record.model_dump(mode="json")
 
     @app.get("/incidents", dependencies=auth)
     async def list_incidents(request: Request, limit: int = 50) -> list[dict[str, Any]]:
+        incidents = await asyncio.to_thread(svc(request).store.list_incidents, min(max(limit, 1), 500))
         return [
             {**i.model_dump(mode="json"), "code": i.code, "duration_minutes": i.duration_minutes}
-            for i in svc(request).store.list_incidents(min(max(limit, 1), 500))
+            for i in incidents
         ]
 
     @app.get("/incidents/{incident_id}", dependencies=auth)
     async def get_incident(incident_id: int, request: Request) -> dict[str, Any]:
         store = svc(request).store
-        incident = store.get_incident(incident_id)
-        if incident is None:
+
+        def load_detail() -> dict[str, Any] | None:
+            incident = store.get_incident(incident_id)
+            if incident is None:
+                return None
+            return {
+                **incident.model_dump(mode="json"),
+                "code": incident.code,
+                "duration_minutes": incident.duration_minutes,
+                "investigations": [r.model_dump(mode="json") for r in store.investigations_for_incident(incident_id)],
+                "actions": [a.model_dump(mode="json") for a in store.actions_for_incident(incident_id)],
+            }
+
+        detail = await asyncio.to_thread(load_detail)
+        if detail is None:
             raise HTTPException(status_code=404, detail="Incident not found")
-        return {
-            **incident.model_dump(mode="json"),
-            "code": incident.code,
-            "duration_minutes": incident.duration_minutes,
-            "investigations": [r.model_dump(mode="json") for r in store.investigations_for_incident(incident_id)],
-            "actions": [a.model_dump(mode="json") for a in store.actions_for_incident(incident_id)],
-        }
+        return detail
 
     @app.get("/incidents/{incident_id}/postmortem", dependencies=auth, response_class=PlainTextResponse)
     async def postmortem(incident_id: int, request: Request) -> PlainTextResponse:
         try:
-            markdown = svc(request).read_postmortem(incident_id)
+            markdown = await asyncio.to_thread(svc(request).read_postmortem, incident_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return PlainTextResponse(markdown, media_type="text/markdown; charset=utf-8")
@@ -280,7 +288,7 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
 
     @app.post("/incidents/{incident_id}/resolution", dependencies=auth)
     async def set_resolution(incident_id: int, body: ResolutionBody, request: Request) -> dict[str, Any]:
-        incident = svc(request).set_resolution(incident_id, body.root_cause, body.fix)
+        incident = await asyncio.to_thread(svc(request).set_resolution, incident_id, body.root_cause, body.fix)
         if incident is None:
             raise HTTPException(status_code=404, detail="Incident not found")
         return incident.model_dump(mode="json")
@@ -288,7 +296,8 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
     @app.post("/investigations/{investigation_id}/feedback", dependencies=auth)
     async def feedback(investigation_id: int, body: FeedbackBody, request: Request) -> dict[str, str]:
         try:
-            return {"message": svc(request).record_feedback(investigation_id, body.choice, body.user)}
+            message = await asyncio.to_thread(svc(request).record_feedback, investigation_id, body.choice, body.user)
+            return {"message": message}
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -335,7 +344,10 @@ def create_app(settings: Settings | None = None, service: IncidentLens | None = 
         if payload.get("type") == "block_actions":
             svc_instance = svc(request)
             request_id = hashlib.sha256(b"v0:" + timestamp.encode() + b":" + body).hexdigest()
-            if not svc_instance.store.claim_interaction(request_id, datetime.now(timezone.utc)):
+            claimed = await asyncio.to_thread(
+                svc_instance.store.claim_interaction, request_id, datetime.now(timezone.utc)
+            )
+            if not claimed:
                 return Response(status_code=200)
             # Slack requires an HTTP response within 3s, so execution continues in the background.
             background.add_task(svc_instance.handle_interaction, *args)

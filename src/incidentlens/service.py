@@ -123,6 +123,14 @@ class IncidentLens:
         self._service_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._digest_lock = asyncio.Lock()
 
+    @property
+    def clock(self) -> Callable[[], datetime]:
+        return self._clock
+
+    @property
+    def pager_configured(self) -> bool:
+        return bool(getattr(self.pager, "configured", True))
+
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
@@ -144,6 +152,23 @@ class IncidentLens:
     def _service_lock(self, service: str) -> asyncio.Lock:
         return self._service_locks.setdefault(service, asyncio.Lock())
 
+    def _ingest_one(self, routed: RoutedAlert, now: datetime) -> tuple[AlertRecord | None, IncidentRecord | None]:
+        alert = routed.alert
+        previous = self.store.get(alert.fingerprint)
+        record = self.store.record(routed, now)
+        if record is None:
+            return None, None
+        closed_old: IncidentRecord | None = None
+        if previous and record.first_seen > previous.first_seen:
+            # Keep old resolves: their PagerDuty keys belong to separate incidents.
+            self.store.cancel_deliveries(alert.fingerprint, "open")
+            closed_old = self.store.close_incident(alert.fingerprint, record.first_seen)
+            if closed_old:
+                self._queue_resolve(closed_old)
+        if alert.status == "firing" and record.receive_count == 1:
+            self.store.log_episode(record, now)
+        return record, closed_old
+
     async def handle_alerts(self, alerts: list[Alert]) -> dict[str, int]:
         counts = {"received": len(alerts), "critical": 0, "action": 0, "info": 0}
         groups: dict[str, list[Alert]] = {}
@@ -156,18 +181,9 @@ class IncidentLens:
                     now = self._clock()
                     routed = self.router.classify(alert)
                     counts[routed.severity.value] += 1
-                    previous = self.store.get(alert.fingerprint)
-                    record = self.store.record(routed, now)
+                    record, _ = await asyncio.to_thread(self._ingest_one, routed, now)
                     if record is None:
                         continue
-                    if previous and record.first_seen > previous.first_seen:
-                        # Keep old resolves: their PagerDuty keys belong to separate incidents.
-                        self.store.cancel_deliveries(alert.fingerprint, "open")
-                        old = self.store.close_incident(alert.fingerprint, record.first_seen)
-                        if old:
-                            self._queue_resolve(old)
-                    if alert.status == "firing" and record.receive_count == 1:
-                        self.store.log_episode(record, now)
                     if alert.status == "resolved":
                         await self._handle_resolved(routed, now)
                     elif routed.severity is Severity.CRITICAL:
@@ -181,13 +197,13 @@ class IncidentLens:
         return counts
 
     def _pager_configured(self) -> bool:
-        return bool(getattr(self.pager, "configured", True))
+        return self.pager_configured
 
     def _notifier_configured(self) -> bool:
         return bool(getattr(self.notifier, "configured", True))
 
     def _with_pager_notice(self, text: str) -> str:
-        if not self._pager_configured():
+        if not self.pager_configured:
             return f"{text}\n⚠️ PagerDuty not configured, nobody was paged"
         return text
 
@@ -203,15 +219,17 @@ class IncidentLens:
         page["dedup_key"] = (
             f"{incident.fingerprint}:incident:{incident.id}" if created else self.store.pager_key(incident)
         )
-        if self._pager_configured():
+        if self.pager_configured:
             self.store.queue_delivery(
                 key + ":pager", incident.fingerprint, incident.id, "pager", "open", page, repeat=repeat
             )
         if self._notifier_configured():
-            self.store.queue_delivery(key + ":slack", incident.fingerprint, incident.id, "slack", "open", {"text": text})
+            self.store.queue_delivery(
+                key + ":slack", incident.fingerprint, incident.id, "slack", "open", {"text": text}
+            )
 
     def _queue_resolve(self, incident: IncidentRecord) -> None:
-        if self._pager_configured():
+        if self.pager_configured:
             self.store.queue_delivery(
                 f"incident:{incident.id}:resolve:pager",
                 incident.fingerprint,
@@ -222,7 +240,8 @@ class IncidentLens:
             )
 
     async def _deliver_notifications(self, fingerprint: str) -> None:
-        for delivery in self.store.pending_deliveries(fingerprint):
+        deliveries = await asyncio.to_thread(self.store.pending_deliveries, fingerprint)
+        for delivery in deliveries:
             payload = delivery["payload"]
             try:
                 if delivery["channel"] == "pager":
@@ -233,19 +252,22 @@ class IncidentLens:
                     )
                 else:
                     text = payload["text"]
-                    if delivery["event"] == "open" and any(
-                        d["channel"] == "pager" and d["event"] == "open"
-                        for d in self.store.pending_deliveries(fingerprint)
-                    ):
-                        text = "<!channel> ⚠️ Could not reach PagerDuty — immediate human attention required!\n" + text
+                    if delivery["event"] == "open":
+                        remaining = await asyncio.to_thread(self.store.pending_deliveries, fingerprint)
+                        if any(d["channel"] == "pager" and d["event"] == "open" for d in remaining):
+                            text = (
+                                "<!channel> ⚠️ Could not reach PagerDuty — immediate human attention required!\n"
+                                + text
+                            )
                     sent = await self.notifier.send(text)
                 if sent or sent == DeliveryStatus.NOT_CONFIGURED:
-                    self.store.finish_delivery(delivery["key"])
+                    await asyncio.to_thread(self.store.finish_delivery, delivery["key"])
             except Exception:
                 log.exception("Notification delivery failed: %s", delivery["key"])
 
     async def retry_notifications(self) -> None:
-        fingerprints = list(dict.fromkeys(d["fingerprint"] for d in self.store.pending_deliveries()))
+        pending = await asyncio.to_thread(self.store.pending_deliveries)
+        fingerprints = list(dict.fromkeys(d["fingerprint"] for d in pending))
 
         async def retry_one(fingerprint: str) -> None:
             async with self._alert_lock(fingerprint):
@@ -254,7 +276,9 @@ class IncidentLens:
         if fingerprints:
             await asyncio.gather(*(retry_one(fp) for fp in fingerprints))
 
-    async def _handle_critical(self, routed: RoutedAlert, record: AlertRecord, now: datetime) -> None:
+    def _prepare_critical(
+        self, routed: RoutedAlert, record: AlertRecord, now: datetime
+    ) -> tuple[IncidentRecord, bool, dict[str, Any], str]:
         alert = routed.alert
         incident, created = self.store.open_incident(record, "critical", now)
         text = f"🔴 *{esc(alert.name)}* on `{esc(alert.service)}` · {incident.code}\n{esc(alert.summary)}"
@@ -269,7 +293,12 @@ class IncidentLens:
             link=alert.source_url,
         )
         self._queue_open(incident, page, text, repeat=True, created=created)
-        if not self._pager_configured():
+        return incident, created, page, text
+
+    async def _handle_critical(self, routed: RoutedAlert, record: AlertRecord, now: datetime) -> None:
+        alert = routed.alert
+        incident, created, page, text = await asyncio.to_thread(self._prepare_critical, routed, record, now)
+        if not self.pager_configured:
             await self.pager.trigger(**page)
         if not self._notifier_configured():
             await self.notifier.send(text)
@@ -277,35 +306,54 @@ class IncidentLens:
         if created:
             self._spawn(self.investigate(InvestigationTarget.from_record(record), incident))
 
-    async def _handle_resolved(self, routed: RoutedAlert, now: datetime) -> None:
+    def _prepare_resolved(
+        self, routed: RoutedAlert, now: datetime
+    ) -> tuple[IncidentRecord | None, str, str | None, bool]:
         alert = routed.alert
         incident = self.store.close_incident(alert.fingerprint, alert.ends_at or now)
         self.store.cancel_deliveries(alert.fingerprint, "open")
         if incident is None:
             incident = self.store.episode_incident(alert.fingerprint, min(alert.starts_at, now))
         if incident is None:
-            # Existing queued resolves are retried even for escalated warning alerts.
-            if routed.severity is Severity.CRITICAL and not self.store.pending_deliveries(alert.fingerprint):
-                await self.pager.resolve(alert.fingerprint)
-            await self._deliver_notifications(alert.fingerprint)
-            return
+            return None, alert.fingerprint, None, not self.store.pending_deliveries(alert.fingerprint)
         key = f"incident:{incident.id}:resolve"
         self._queue_resolve(incident)
-        if not self._pager_configured():
-            await self.pager.resolve(self.store.pager_key(incident))
+        dedup = self.store.pager_key(incident)
         path = self.write_postmortem(incident.id, overwrite=False)
         text = (
             f"✅ Resolved: *{esc(incident.name)}* on `{esc(incident.service)}` · {incident.code} · "
             f"{incident.duration_minutes} minutes\nPostmortem draft: `{path}`"
         )
         if self._notifier_configured():
-            self.store.queue_delivery(key + ":slack", alert.fingerprint, incident.id, "slack", "resolve", {"text": text})
-        else:
+            self.store.queue_delivery(
+                key + ":slack", alert.fingerprint, incident.id, "slack", "resolve", {"text": text}
+            )
+        return incident, dedup, text, False
+
+    async def _handle_resolved(self, routed: RoutedAlert, now: datetime) -> None:
+        alert = routed.alert
+        incident, dedup, text, no_pending = await asyncio.to_thread(self._prepare_resolved, routed, now)
+        if incident is None:
+            # Existing queued resolves are retried even for escalated warning alerts.
+            if routed.severity is Severity.CRITICAL and no_pending:
+                await self.pager.resolve(alert.fingerprint)
+            await self._deliver_notifications(alert.fingerprint)
+            return
+        if not self.pager_configured:
+            await self.pager.resolve(dedup)
+        if not self._notifier_configured() and text is not None:
             await self.notifier.send(text)
         await self._deliver_notifications(alert.fingerprint)
         self._spawn(asyncio.to_thread(self.archive.sync, f"Postmortem {incident.code}"))
 
     # ---------- Investigation & feedback ----------
+
+    def _persist_investigation(
+        self, result: Any, incident: IncidentRecord | None
+    ) -> tuple[InvestigationRecord, str | None]:
+        record = self.store.save_investigation(result, incident.id if incident else None, self._clock())
+        refreshed = self._refresh_postmortem_file(incident.id) if incident else None
+        return record, refreshed
 
     async def investigate(
         self,
@@ -321,9 +369,9 @@ class IncidentLens:
             return None
         if result is None:
             return None
-        record = self.store.save_investigation(result, incident.id if incident else None, self._clock())
-        if incident:
-            self._refresh_existing_postmortem(incident.id)
+        record, refreshed = await asyncio.to_thread(self._persist_investigation, result, incident)
+        if refreshed and self.archive.git_push:
+            self._spawn(asyncio.to_thread(self.archive.sync, f"Update postmortem {refreshed}"))
         if announce:
             actions = self.actions.available_for(target.service) if incident else []
             text, blocks = investigation_card(record, incident, actions, self.catalog.get(target.service).runbook)
@@ -360,6 +408,104 @@ class IncidentLens:
 
     # ---------- Human-approved actions ----------
 
+    def _begin_action(
+        self,
+        incident_id: int,
+        action: str,
+        user_id: str,
+        actor: str,
+        confirm_repeat: bool | int,
+    ) -> tuple[IncidentRecord, ActionResult | None, list[dict[str, Any]] | None, int | None, str | None]:
+        incident = self.store.get_incident(incident_id)
+        if incident is None:
+            raise LookupError("Incident not found")
+        now = self._clock()
+        blocks: list[dict[str, Any]] | None = None
+        denied: ActionResult | None = None
+        if incident.resolved_at is not None:
+            denied = ActionResult(
+                status="denied",
+                message="Incident is already resolved; actions are disabled",
+            )
+        elif (auth_denied := self.actions.authorize(action, incident.service, user_id)) is not None:
+            denied = auth_denied
+        else:
+            cooldown = timedelta(seconds=self.actions.cooldown_for(action))
+            last = self.store.last_attempted_action(incident.service)
+            if cooldown > timedelta(0) and last is not None and (now - last.at) < cooldown:
+                remaining = max(1, int((cooldown - (now - last.at)).total_seconds()))
+                denied = ActionResult(
+                    status="denied",
+                    message=(
+                        f"Service `{incident.service}` is in cooldown after `{last.action}` ({remaining}s remaining)"
+                    ),
+                )
+            else:
+                prior = (
+                    self.store.last_incident_attempt(incident_id, action)
+                    if self.actions.enabled and self.actions.requires_reconfirm(action)
+                    else None
+                )
+                if isinstance(confirm_repeat, bool):
+                    confirmed = confirm_repeat
+                else:
+                    confirmed = prior is not None and confirm_repeat == prior.id
+                if prior is not None and not confirmed:
+                    denied = ActionResult(
+                        status="denied",
+                        message=(
+                            f"`{action}` was already attempted on {incident.code} "
+                            f"({prior.status} at {prior.at:%H:%M:%S} UTC); "
+                            "explicit re-confirmation is required to run it again on this incident"
+                        ),
+                    )
+                    blocks = _reconfirm_blocks(incident, action, self.actions.label(action), prior)
+
+        if denied is not None:
+            self.store.log_action(
+                self._clock(),
+                incident_id,
+                action,
+                incident.service,
+                actor,
+                denied.status,
+                denied.exit_code,
+                denied.output,
+            )
+            refreshed = self._refresh_postmortem_file(incident_id)
+            return incident, denied, blocks, None, refreshed
+
+        started_id = (
+            self.store.start_action(now, incident_id, action, incident.service, actor)
+            if self.actions.enabled
+            else None
+        )
+        return incident, None, None, started_id, None
+
+    def _finalize_action(
+        self,
+        incident: IncidentRecord,
+        action: str,
+        actor: str,
+        user_name: str,
+        started_id: int | None,
+        result: ActionResult,
+    ) -> str | None:
+        now = self._clock()
+        if started_id is not None:
+            self.store.finish_action(started_id, now, result.status, result.exit_code, result.output)
+        else:
+            self.store.log_action(
+                now, incident.id, action, incident.service, actor, result.status, result.exit_code, result.output
+            )
+        if result.status == "executed":
+            self.store.set_resolution(
+                incident.id,
+                fix=f"{self.actions.label(action)} (approved by {user_name})",
+                only_if_empty=True,
+            )
+        return self._refresh_postmortem_file(incident.id)
+
     async def _execute_action(
         self,
         incident_id: int,
@@ -369,70 +515,23 @@ class IncidentLens:
         *,
         confirm_repeat: bool | int = False,
     ) -> tuple[str, list[dict[str, Any]] | None]:
-        incident = self.store.get_incident(incident_id)
-        if incident is None:
+        initial = await asyncio.to_thread(self.store.get_incident, incident_id)
+        if initial is None:
             raise LookupError("Incident not found")
-        blocks: list[dict[str, Any]] | None = None
-        async with self._service_lock(incident.service):
-            incident = self.store.get_incident(incident_id)
-            if incident is None:
-                raise LookupError("Incident not found")
-            now = self._clock()
-            if incident.resolved_at is not None:
-                result = ActionResult(
-                    status="denied",
-                    message="Incident is already resolved; actions are disabled",
-                )
-            elif (denied := self.actions.authorize(action, incident.service, user_id)) is not None:
+        actor = f"{user_name} ({user_id})"
+        async with self._service_lock(initial.service):
+            incident, denied, blocks, started_id, refreshed = await asyncio.to_thread(
+                self._begin_action, incident_id, action, user_id, actor, confirm_repeat
+            )
+            if denied is not None:
                 result = denied
             else:
-                cooldown = timedelta(seconds=self.actions.cooldown_for(action))
-                last = self.store.last_attempted_action(incident.service)
-                if cooldown > timedelta(0) and last is not None and (now - last.at) < cooldown:
-                    remaining = max(1, int((cooldown - (now - last.at)).total_seconds()))
-                    result = ActionResult(
-                        status="denied",
-                        message=f"Service `{incident.service}` is in cooldown after `{last.action}` ({remaining}s remaining)",
-                    )
-                else:
-                    prior = (
-                        self.store.last_incident_attempt(incident_id, action)
-                        if self.actions._enabled and self.actions.requires_reconfirm(action)
-                        else None
-                    )
-                    if isinstance(confirm_repeat, bool):
-                        confirmed = confirm_repeat
-                    else:
-                        confirmed = prior is not None and confirm_repeat == prior.id
-                    if prior is not None and not confirmed:
-                        result = ActionResult(
-                            status="denied",
-                            message=(
-                                f"`{action}` was already attempted on {incident.code} "
-                                f"({prior.status} at {prior.at:%H:%M:%S} UTC); "
-                                "explicit re-confirmation is required to run it again on this incident"
-                            ),
-                        )
-                        blocks = _reconfirm_blocks(incident, action, self.actions.label(action), prior)
-                    else:
-                        result = await self.actions.run(action, incident.service, user_id)
-            self.store.log_action(
-                self._clock(),
-                incident_id,
-                action,
-                incident.service,
-                f"{user_name} ({user_id})",
-                result.status,
-                result.exit_code,
-                result.output,
-            )
-            if result.status == "executed":
-                self.store.set_resolution(
-                    incident_id,
-                    fix=f"{self.actions.label(action)} (approved by {user_name})",
-                    only_if_empty=True,
+                result = await self.actions.run(action, incident.service, user_id)
+                refreshed = await asyncio.to_thread(
+                    self._finalize_action, incident, action, actor, user_name, started_id, result
                 )
-            self._refresh_existing_postmortem(incident_id)
+            if refreshed and self.archive.git_push:
+                self._spawn(asyncio.to_thread(self.archive.sync, f"Update postmortem {refreshed}"))
         icon = {"executed": "✅", "dry-run": "🧪", "denied": "⛔", "failed": "❌"}[result.status]
         return f"{icon} {incident.code}: {result.message}", blocks
 
@@ -463,18 +562,18 @@ class IncidentLens:
         try:
             if action_id.startswith("fb_"):
                 investigation_id, choice = value.split(":")
-                message = self.record_feedback(int(investigation_id), int(choice), user_name)
+                message = await asyncio.to_thread(self.record_feedback, int(investigation_id), int(choice), user_name)
             elif action_id.startswith("act_"):
                 parts = value.split(":")
                 if len(parts) == 2:
                     incident_id_s, name = parts
                     confirm_repeat: bool | int = False
-                elif len(parts) == 3 and parts[2] == "confirm":
-                    incident_id_s, name, _ = parts
-                    confirm_repeat = True
                 elif len(parts) == 4 and parts[2] == "confirm":
                     incident_id_s, name, _, prior_id_s = parts
-                    confirm_repeat = int(prior_id_s)
+                    prior_id = int(prior_id_s)
+                    if prior_id <= 0:
+                        raise ValueError("Invalid action payload")
+                    confirm_repeat = prior_id
                 else:
                     raise ValueError("Invalid action payload")
                 message, blocks = await self._execute_action(
@@ -492,36 +591,45 @@ class IncidentLens:
 
     # ---------- Escalation ----------
 
+    def _prepare_escalation(
+        self, fingerprint: str, now: datetime
+    ) -> tuple[AlertRecord, IncidentRecord, bool, dict[str, Any], str] | None:
+        record = self.store.get(fingerprint)
+        if record is None:
+            return None
+        reason = self.router.escalation_reason(record, now)
+        if not reason:
+            return None
+        incident, created = self.store.open_incident(record, "escalated", now)
+        text = self._with_pager_notice(
+            f"⬆️🔴 *Auto-escalated:* {esc(record.name)} on `{esc(record.service)}` · "
+            f"{incident.code} — {reason}"
+        )
+        page: dict[str, Any] = dict(
+            dedup_key=record.fingerprint,
+            summary=f"[Escalated] {record.name} on {record.service}: {reason}",
+            source=record.service,
+            details={"reason": reason, "first_seen": record.first_seen.isoformat()},
+            link=record.source_url,
+        )
+        self._queue_open(incident, page, text, created=created)
+        self.store.mark_escalated(record.fingerprint, now)
+        return record, incident, created, page, text
+
     async def check_escalations(self) -> list[str]:
         await self.retry_notifications()
-        candidates = self.store.escalation_candidates()
+        candidates = await asyncio.to_thread(self.store.escalation_candidates)
         if not candidates:
             return []
 
         async def escalate_one(candidate: AlertRecord) -> str | None:
             async with self._alert_lock(candidate.fingerprint):
                 now = self._clock()
-                record = self.store.get(candidate.fingerprint)
-                if record is None:
+                prepared = await asyncio.to_thread(self._prepare_escalation, candidate.fingerprint, now)
+                if prepared is None:
                     return None
-                reason = self.router.escalation_reason(record, now)
-                if not reason:
-                    return None
-                incident, created = self.store.open_incident(record, "escalated", now)
-                text = self._with_pager_notice(
-                    f"⬆️🔴 *Auto-escalated:* {esc(record.name)} on `{esc(record.service)}` · "
-                    f"{incident.code} — {reason}"
-                )
-                page: dict[str, Any] = dict(
-                    dedup_key=record.fingerprint,
-                    summary=f"[Escalated] {record.name} on {record.service}: {reason}",
-                    source=record.service,
-                    details={"reason": reason, "first_seen": record.first_seen.isoformat()},
-                    link=record.source_url,
-                )
-                self._queue_open(incident, page, text, created=created)
-                self.store.mark_escalated(record.fingerprint, now)
-                if not self._pager_configured():
+                record, incident, created, page, text = prepared
+                if not self.pager_configured:
                     await self.pager.trigger(**page)
                 if not self._notifier_configured():
                     await self.notifier.send(text)
@@ -539,8 +647,7 @@ class IncidentLens:
         async with self._digest_lock:
             return await self._run_digest()
 
-    async def _run_digest(self) -> Path | None:
-        now = self._clock()
+    def _load_digest_inputs(self, now: datetime) -> tuple[list[AlertRecord], datetime]:
         records = self.store.pending_for_digest()
         last = self.store.kv_get("last_digest_at")
         window_start = (
@@ -548,6 +655,19 @@ class IncidentLens:
             if last
             else (min(r.first_seen for r in records) if records else now)
         )
+        return records, window_start
+
+    def _persist_digest(
+        self, groups: list[Any], records: list[AlertRecord], window_start: datetime, now: datetime
+    ) -> Path:
+        path = self.archive.write(render_digest(groups, window_start, now), now)
+        self.store.mark_digest_snapshot(records)
+        self.store.kv_set("last_digest_at", now.isoformat())
+        return path
+
+    async def _run_digest(self) -> Path | None:
+        now = self._clock()
+        records, window_start = await asyncio.to_thread(self._load_digest_inputs, now)
         if not records:
             log.info("No pending alerts for digest")
             return None
@@ -566,9 +686,7 @@ class IncidentLens:
                 result = await self.investigate(InvestigationTarget.from_record(group.records[0]), announce=False)
                 group.investigation = result.investigation if result else None
 
-        path = self.archive.write(render_digest(groups, window_start, now), now)
-        self.store.mark_digest_snapshot(records)
-        self.store.kv_set("last_digest_at", now.isoformat())
+        path = await asyncio.to_thread(self._persist_digest, groups, records, window_start, now)
         ongoing = sum(1 for g in groups if g.is_ongoing)
         await self.notifier.send(f"📋 New digest: {len(groups)} group(s) ({ongoing} ongoing) · `{path}`")
         self._spawn(asyncio.to_thread(self.archive.sync, f"Digest {now:%Y-%m-%d %H:%M}"))
@@ -592,21 +710,25 @@ class IncidentLens:
             return False
         return _postmortem_hash(path.read_text(encoding="utf-8")) == saved_hash
 
-    def _refresh_existing_postmortem(self, incident_id: int) -> None:
+    def _refresh_postmortem_file(self, incident_id: int) -> str | None:
         incident = self.store.get_incident(incident_id)
         if incident is None:
-            return
+            return None
         path = self.archive.root / f"postmortems/{incident.code}.md"
         if not path.exists() or not self._is_postmortem_unedited(incident.id, path):
-            return
+            return None
         self.write_postmortem(incident.id, overwrite=False)
-        if self.archive._git_push:
+        return incident.code
+
+    def _refresh_existing_postmortem(self, incident_id: int) -> None:
+        code = self._refresh_postmortem_file(incident_id)
+        if code and self.archive.git_push:
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                self.archive.sync(f"Update postmortem {incident.code}")
+                self.archive.sync(f"Update postmortem {code}")
             else:
-                self._spawn(asyncio.to_thread(self.archive.sync, f"Update postmortem {incident.code}"))
+                self._spawn(asyncio.to_thread(self.archive.sync, f"Update postmortem {code}"))
 
     def read_postmortem(self, incident_id: int) -> str:
         incident = self.store.get_incident(incident_id)
@@ -630,10 +752,14 @@ class IncidentLens:
         self.store.kv_set(f"postmortem_sha256:{incident.id}", _postmortem_hash(markdown))
         return written
 
-    async def publish_roi(self, month_start: datetime, announce: bool = True) -> tuple[Path, str]:
+    def _build_and_write_roi(self, month_start: datetime) -> tuple[ Any, str, Path]:
         report = compute_roi(self.store, self.baseline, month_start, self._clock())
         markdown = render_roi(report)
         path = self.archive.write_named(f"reports/roi-{month_start:%Y-%m}.md", markdown)
+        return report, markdown, path
+
+    async def publish_roi(self, month_start: datetime, announce: bool = True) -> tuple[Path, str]:
+        report, markdown, path = await asyncio.to_thread(self._build_and_write_roi, month_start)
         if announce:
             accuracy = "unrated" if report.accuracy is None else f"{report.accuracy * 100:.0f}%"
             await self.notifier.send(
@@ -643,17 +769,24 @@ class IncidentLens:
             self._spawn(asyncio.to_thread(self.archive.sync, f"ROI report {month_start:%Y-%m}"))
         return path, markdown
 
-    async def run_maintenance(self) -> dict[str, Any]:
-        """Run daily retention cleanup and publish the previous month's ROI report once."""
-        now = self._clock()
+    def _prepare_maintenance(self, now: datetime) -> tuple[dict[str, int], bool, datetime, str | None]:
         purged = self.store.purge(now - self._retention)
         previous = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)).replace(day=1)
         label = f"{previous:%Y-%m}"
+        if self.store.kv_get("last_roi_month") == label:
+            return purged, False, previous, None
+        end = (previous + timedelta(days=32)).replace(day=1)
+        has_activity = bool(self.store.count_episodes(previous, end) or self.store.incidents_between(previous, end))
+        return purged, has_activity, previous, label
+
+    async def run_maintenance(self) -> dict[str, Any]:
+        """Run daily retention cleanup and publish the previous month's ROI report once."""
+        now = self._clock()
+        purged, should_publish, previous, label = await asyncio.to_thread(self._prepare_maintenance, now)
         report: str | None = None
-        if self.store.kv_get("last_roi_month") != label:
-            end = (previous + timedelta(days=32)).replace(day=1)
-            if self.store.count_episodes(previous, end) or self.store.incidents_between(previous, end):
+        if label is not None:
+            if should_publish:
                 path, _ = await self.publish_roi(previous)
                 report = str(path)
-            self.store.kv_set("last_roi_month", label)
+            await asyncio.to_thread(self.store.kv_set, "last_roi_month", label)
         return {"purged": purged, "roi_report": report}

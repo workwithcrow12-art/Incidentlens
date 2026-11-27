@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 class ServiceInfo(BaseModel):
     team: str = "Unassigned"
     repo: str | None = None
+    environment: str = "production"
     depends_on: list[str] = Field(default_factory=list)
     runbook: str | None = None
 

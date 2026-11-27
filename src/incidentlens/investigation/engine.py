@@ -43,11 +43,14 @@ log = logging.getLogger(__name__)
 
 _RANK: dict[Confidence, int] = {"high": 0, "medium": 1, "low": 2}
 _REGEX_MATCHER = re.compile(r'(=~\s*")([^"]*\{service\}[^"]*)(")')
+_SATURATION_LOG_RE = re.compile(
+    r"(?i)\b(outofmemory\w*|oom\w*|memory|heap|cpu|throttl\w*|restart\w*|crash\w*|panic|killed|sigkill)\b"
+)
 
 
 def render_service_query(template: str, service: str) -> str:
-    """Substitute {service} into PromQL/LogQL, escaping regex dots inside =~ matchers."""
-    escaped = service.replace(".", r"\.")
+    """Substitute {service} into PromQL/LogQL, escaping regex dots inside double-quoted =~ matchers."""
+    escaped = service.replace(".", r"\\.")
     rendered = _REGEX_MATCHER.sub(
         lambda m: f"{m.group(1)}{m.group(2).replace('{service}', escaped)}{m.group(3)}",
         template,
@@ -97,11 +100,15 @@ def rule_hypotheses(target: InvestigationTarget, findings: list[Finding]) -> lis
             else "incident started right around deploy time"
         )
         who = f" by {d.meta['author']}" if d.meta.get("author") else ""
-        caveat = "" if direct else " (timing correlation only; no direct behavioral evidence yet)"
+        caveat = (
+            " (timing correlation only)"
+            if direct
+            else " (timing correlation only; no direct behavioral evidence yet)"
+        )
         hypotheses.append(
             _hypothesis(
                 f"Deploy `{d.meta['ref']}`{who} at {d.meta['created_at']:%H:%M} UTC may be the cause: {timing}{caveat}",
-                [d, *direct],
+                [d],
             )
         )
 
@@ -122,10 +129,11 @@ def rule_hypotheses(target: InvestigationTarget, findings: list[Finding]) -> lis
     saturated = [f for f in by_kind.get("metric", []) if f.meta.get("category") in ("saturation", "restarts")]
     if saturated:
         titles = ", ".join(f.meta["title"] for f in saturated)
+        corroborating_logs = [f for f in by_kind.get("log", []) if _SATURATION_LOG_RE.search(f.description)]
         hypotheses.append(
             _hypothesis(
                 f"Resources on `{target.service}` are saturated or unstable: {titles}",
-                [*saturated, *by_kind.get("log", [])],
+                [*saturated, *corroborating_logs],
             )
         )
 
@@ -182,14 +190,14 @@ class EvidenceEngine:
             return_exceptions=True,
         )
         findings: list[Finding] = []
-        for name, result in zip(("metric", "log", "deploy"), collected):
+        for name, result in zip(("metric", "log", "deploy"), collected, strict=True):
             if isinstance(result, BaseException):
                 # A single failing evidence collector must never abort the investigation.
                 log.warning("Failed to collect %s evidence for %s: %r", name, target.service, result)
             else:
                 findings.extend(result)
-        findings.extend(self._dependencies(target))
-        similar = self._memory.find_similar(target)
+        dep_findings, similar = await asyncio.to_thread(self._local_context, target)
+        findings.extend(dep_findings)
         findings.extend(self._memory_findings(similar))
         for n, f in enumerate(findings, 1):
             f.id = f"E{n}"
@@ -197,7 +205,7 @@ class EvidenceEngine:
         evidence = [Evidence(id=f.id, kind=f.kind, description=f.description, url=f.url) for f in findings]
         hypotheses: list[Hypothesis] = rule_hypotheses(target, findings)
         engine: str = "rules"
-        if self._synthesizer and evidence:
+        if self._synthesizer and hypotheses:
             refined = await self._synthesizer.refine(target, evidence, hypotheses)
             if refined:
                 hypotheses, engine = refined, "llm"
@@ -247,7 +255,7 @@ class EvidenceEngine:
 
         results = await asyncio.gather(*(check(s) for s in self._signals.signals), return_exceptions=True)
         findings: list[Finding] = []
-        for signal, result in zip(self._signals.signals, results):
+        for signal, result in zip(self._signals.signals, results, strict=True):
             if isinstance(result, BaseException):
                 log.warning("Signal %s check failed: %r", signal.name, result)
             elif result is not None:
@@ -267,7 +275,7 @@ class EvidenceEngine:
             loki.count(query, now, window),
             loki.count(query, before_at, window),
         )
-        if current < cfg.min_lines or current < 2 * before:
+        if current is None or before is None or current < cfg.min_lines or current < 2 * before:
             return []
         start = now - timedelta(seconds=window)
         patterns = top_patterns(await loki.lines(query, start, now))
@@ -293,6 +301,9 @@ class EvidenceEngine:
             )
         return findings
 
+    def _local_context(self, target: InvestigationTarget) -> tuple[list[Finding], list[SimilarIncident]]:
+        return self._dependencies(target), self._memory.find_similar(target)
+
     def _dependencies(self, target: InvestigationTarget) -> list[Finding]:
         findings: list[Finding] = []
         for dep in self._catalog.get(target.service).depends_on:
@@ -304,7 +315,8 @@ class EvidenceEngine:
                 findings.append(
                     Finding(
                         "dependency",
-                        f"`{dep}` has firing alert {alert.name} since {alert.first_seen:%H:%M} UTC: {redact(alert.summary)}",
+                        f"`{dep}` has firing alert {alert.name} since {alert.first_seen:%H:%M} UTC: "
+                        f"{redact(alert.summary)}",
                         url,
                         {"service": dep, "name": alert.name},
                     )

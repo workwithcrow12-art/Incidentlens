@@ -22,6 +22,10 @@ class DigestArchive:
         self._git_push = git_push
         self._sync_lock = Lock()
 
+    @property
+    def git_push(self) -> bool:
+        return self._git_push
+
     def write(self, markdown: str, at: datetime) -> Path:
         base = self.root / f"{at:%Y}/{at:%m}/digest-{at:%Y%m%d-%H%M}.md"
         base.parent.mkdir(parents=True, exist_ok=True)

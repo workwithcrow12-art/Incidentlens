@@ -30,6 +30,9 @@ def _card(match: re.Match[str]) -> str:
     return "[CARD]" if 13 <= len(digits) <= 19 and _luhn(digits) else match.group(0)
 
 
+_PLACEHOLDERS = {"[REDACTED]", "[TOKEN]", "[API_KEY]", "[GITHUB_TOKEN]", "[SLACK_TOKEN]", "[JWT]", "[AWS_KEY]"}
+
+
 def _url_credentials(match: re.Match[str]) -> str:
     scheme, raw = match.group(1), match.group(2)
     trimmed = raw.rstrip("),.;]")
@@ -43,14 +46,28 @@ def _url_credentials(match: re.Match[str]) -> str:
     if "@" not in authority_and_path:
         return match.group(0)
     userinfo, host_and_path = authority_and_path.rsplit("@", 1)
-    if ":" not in userinfo or not host_and_path:
-        return match.group(0)
-    user, password = userinfo.split(":", 1)
-    if "/" in user or not password:
-        return match.group(0)
-    if re.match(r"^\d{1,5}/", password) and re.fullmatch(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", host_and_path):
-        return match.group(0)
-    return f"{scheme}{user}:[REDACTED]@{host_and_path}{tail}{suffix}"
+    if host_and_path:
+        if ":" in userinfo:
+            user, password = userinfo.split(":", 1)
+            if "/" not in user and password and password not in _PLACEHOLDERS:
+                if not (
+                    re.match(r"^\d{1,5}/", password)
+                    and re.fullmatch(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", host_and_path)
+                ):
+                    return f"{scheme}{user}:[REDACTED]@{host_and_path}{tail}{suffix}"
+        elif "/" not in userinfo and userinfo and userinfo not in _PLACEHOLDERS:
+            return f"{scheme}[REDACTED]@{host_and_path}{tail}{suffix}"
+    authority, slash, rest_path = authority_and_path.partition("/")
+    if "@" in authority:
+        auth_user, host = authority.rsplit("@", 1)
+        if host and auth_user:
+            if ":" in auth_user:
+                user, password = auth_user.split(":", 1)
+                if password and password not in _PLACEHOLDERS:
+                    return f"{scheme}{user}:[REDACTED]@{host}{slash}{rest_path}{tail}{suffix}"
+            elif auth_user not in _PLACEHOLDERS:
+                return f"{scheme}[REDACTED]@{host}{slash}{rest_path}{tail}{suffix}"
+    return match.group(0)
 
 
 _AUTH_SCHEME = re.compile(r"(?i)^(bearer|basic|token|apikey|api-key|digest)\s+(.+)$")

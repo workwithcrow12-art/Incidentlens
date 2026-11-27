@@ -74,7 +74,12 @@ def test_webhook_incident_and_lookup(lens, world, clock):
         assert c.post("/escalations/check").json() == {"escalated": []}
         clock.now += timedelta(hours=5)  # 🟡 warning remains unresolved after 5 hours
         assert c.post("/escalations/check").json() == {"escalated": ["a1b2c3d4e5f60002"]}
-        assert c.post("/maintenance/run").json()["purged"] == {"alerts": 0, "episodes": 0}
+        assert c.post("/maintenance/run").json()["purged"] == {
+            "alerts": 0,
+            "episodes": 0,
+            "interactions": 0,
+            "deliveries": 0,
+        }
 
 
 def test_feedback_resolution_postmortem_and_roi(lens):
@@ -297,3 +302,39 @@ def test_get_postmortem_is_read_only_and_preserves_manual_edits(lens, clock):
         assert fetched.status_code == 200
         assert "Manual postmortem edit by engineer." in fetched.text
     assert postmortem_file.read_text(encoding="utf-8") == edited
+
+
+async def test_slow_database_call_does_not_block_async_event_loop(lens, monkeypatch):
+    import httpx
+
+    entered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_list = lens.store.list_incidents
+
+    def slow_list_incidents(limit: int = 50):
+        loop.call_soon_threadsafe(entered.set)
+        time.sleep(0.25)
+        return original_list(limit)
+
+    monkeypatch.setattr(lens.store, "list_incidents", slow_list_incidents)
+    app = create_app(Settings(enable_scheduler=False, _env_file=None, webhook_token=TOKEN), service=lens)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test", headers=headers) as ac:
+            slow_req = asyncio.create_task(ac.get("/incidents"))
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            t0 = time.monotonic()
+            health = await ac.get("/healthz")
+            elapsed = time.monotonic() - t0
+            assert health.status_code == 200
+            assert elapsed < 0.15  # Responds while slow DB call is still sleeping in worker thread
+            resp = await slow_req
+            assert resp.status_code == 200
+
+
+def test_dockerfile_uses_locked_uv_and_non_root_user():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "uv.lock" in dockerfile
+    assert "uv sync --locked" in dockerfile
+    user_lines = [line.strip() for line in dockerfile.splitlines() if line.strip().startswith("USER ")]
+    assert user_lines and user_lines[-1] != "USER root" and user_lines[-1] != "USER 0"

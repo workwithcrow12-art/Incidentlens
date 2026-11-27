@@ -4,7 +4,7 @@ oncall_headcount: 10                          # number of engineers in the on-ca
 minutes_saved_per_correct_investigation: 20   # estimated time saved per human-confirmed investigation
 
 # Pre-adoption measurements (record during initial pilot).
-# Leave null when unmeasured: the report explicitly labels estimates or omits comparisons.
+# Leave null when unmeasured: the report shows "—" until measured baselines are configured.
 before:
   interruptions_per_person_per_day: null
   mttr_minutes: null

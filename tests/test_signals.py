@@ -1,8 +1,19 @@
+import logging
 import re
 
+import pytest
+
+from conftest import START
+from incidentlens.catalog import ServiceCatalog, ServiceInfo
 from incidentlens.investigation.engine import render_service_query
 from incidentlens.investigation.signals import Signal, SignalConfig, compare, fmt
-from incidentlens.testing import CONFIG
+from incidentlens.models import InvestigationTarget
+from incidentlens.testing import CONFIG, SimulatedWorld, simulated_service, validate_promql_strings
+
+
+def unquote_promql_string(literal_body: str) -> str:
+    validate_promql_strings(f'"{literal_body}"')
+    return bytes(literal_body, "utf-8").decode("unicode_escape")
 
 
 def sig(**kw):
@@ -69,8 +80,37 @@ def test_shipped_config_is_valid_and_pod_queries_do_not_match_other_services():
         ):
             assert not pattern.fullmatch(other_service_pod), other_service_pod
 
-        dotted = re.search(r'pod=~"([^"]+)"', render_service_query(s.query, "svc.v2"))
+        dotted_query = render_service_query(s.query, "svc.v2")
+        validate_promql_strings(dotted_query)
+        dotted = re.search(r'pod=~"((?:\\.|[^"\\])*)"', dotted_query)
         assert dotted is not None
-        dotted_re = re.compile(dotted.group(1))
+        assert r"svc\\.v2-" in dotted.group(1)
+        unquoted_regex = unquote_promql_string(dotted.group(1))
+        assert unquoted_regex.startswith(r"svc\.v2-")
+        dotted_re = re.compile(unquoted_regex)
         assert dotted_re.fullmatch("svc.v2-7d9f8b6c5-x2k4q")
         assert not dotted_re.fullmatch("svcXv2-7d9f8b6c5-x2k4q")
+
+    with pytest.raises(ValueError, match="Invalid Go string escape"):
+        validate_promql_strings('max(container_memory_working_set_bytes{pod=~"svc\\.v2-0"})')
+
+
+async def test_dotted_service_name_collects_pod_metrics_without_warnings(tmp_path, clock, caplog):
+    world = SimulatedWorld(START, broken="svc.v2")
+    lens = simulated_service(tmp_path, clock, world)
+    lens.catalog = ServiceCatalog({"svc.v2": ServiceInfo(team="Platform Team", repo="your-org/svc.v2")})
+    lens.investigator._catalog = lens.catalog
+
+    tgt = InvestigationTarget(
+        fingerprint="svc.v2-HighLatency",
+        service="svc.v2",
+        name="HighLatency",
+        summary="p95 latency high",
+        started_at=START,
+    )
+    with caplog.at_level(logging.WARNING):
+        inv = await lens.investigator.investigate(tgt)
+
+    assert not [r for r in caplog.records if "Signal" in r.message or "Failed to collect" in r.message]
+    metrics = [e.description for e in inv.evidence if e.kind == "metric"]
+    assert any(m.startswith("Memory usage: 200 MB") for m in metrics)

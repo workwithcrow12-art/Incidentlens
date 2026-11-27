@@ -22,9 +22,13 @@ def target(service="auth-service", name="HighLatency", summary="p95 latency 450m
 def test_confidence_rules():
     assert confidence_for({"change"}) == "low"  # Timing correlation only
     assert confidence_for({"memory"}) == "low"  # Historical similarity only
-    assert confidence_for({"change", "metric"}) == "medium"
+    assert confidence_for({"change", "metric"}) == "low"  # Unlinked symptom does not prove deploy causality
+    assert confidence_for({"change", "metric", "log"}) == "low"
+    assert confidence_for({"memory", "metric", "log"}) == "low"
+    assert confidence_for({"metric"}) == "medium"
     assert confidence_for({"dependency"}) == "medium"
-    assert confidence_for({"change", "metric", "log"}) == "high"
+    assert confidence_for({"metric", "log"}) == "high"
+    assert confidence_for({"metric", "dependency"}) == "high"
 
 
 async def test_full_investigation_finds_deploy(lens):
@@ -34,9 +38,14 @@ async def test_full_investigation_finds_deploy(lens):
     assert all(e.url.startswith("http") for e in inv.evidence)
 
     top = inv.hypotheses[0]
-    assert "a1b2c3d" in top.statement and "30 minutes after deploy" in top.statement
+    assert "Resources on `auth-service` are saturated" in top.statement
     assert top.confidence == "high"
-    assert {e.kind for e in inv.evidence_for(top)} == {"metric", "log", "change"}
+    assert {e.kind for e in inv.evidence_for(top)} == {"metric", "log"}
+
+    deploy = inv.hypotheses[1]
+    assert "a1b2c3d" in deploy.statement and "30 minutes after deploy" in deploy.statement
+    assert deploy.confidence == "low"
+    assert [e.kind for e in inv.evidence_for(deploy)] == ["change"]
     assert inv.engine == "rules"
 
     metrics = [e.description for e in inv.evidence if e.kind == "metric"]
@@ -45,6 +54,21 @@ async def test_full_investigation_finds_deploy(lens):
 
     logs = next(e.description for e in inv.evidence if e.kind == "log")
     assert "87 error log lines" in logs and "[EMAIL]" in logs and "@example.com" not in logs
+
+
+def test_unrelated_error_logs_do_not_raise_saturation_to_high():
+    sat = Finding(
+        "metric",
+        "Memory usage: 200 MB → 800 MB",
+        "http://p/1",
+        {"category": "saturation", "title": "Memory usage"},
+        id="E1",
+    )
+    unrelated_log = Finding("log", "40 error log lines: Invalid coupon code", "http://l/1", id="E2")
+    hyps = rule_hypotheses(target(), [sat, unrelated_log])
+    assert len(hyps) == 1
+    assert hyps[0].confidence == "medium"
+    assert hyps[0].evidence_ids == ["E1"]
 
 
 async def test_deploy_without_direct_evidence_is_low_confidence(tmp_path, clock):
@@ -76,6 +100,18 @@ async def test_missing_prometheus_baseline_creates_no_false_evidence(lens):
     assert inv.evidence == [] and inv.hypotheses == []
 
 
+async def test_missing_loki_baseline_creates_no_false_log_evidence(lens):
+    async def missing_baseline_count(query, at, window):
+        return None if at < START else 87
+
+    lens.investigator._prometheus = None
+    lens.investigator._loki.count = missing_baseline_count
+    lens.investigator._changes = type("None_", (), {"recent_changes": staticmethod(lambda *a: _empty())})()
+
+    inv = await lens.investigator.investigate(target())
+    assert inv.evidence == [] and inv.hypotheses == []
+
+
 @pytest.mark.parametrize("minutes_after", [1, 5, 10, 60])
 async def test_deploy_after_incident_is_not_blamed(tmp_path, clock, minutes_after):
     world = SimulatedWorld(START, deploy_minutes_before=-minutes_after)
@@ -90,7 +126,7 @@ async def test_deploy_at_incident_start_remains_a_candidate(tmp_path, clock):
     lens = simulated_service(tmp_path, clock, world)
     inv = await lens.investigator.investigate(target())
     assert any(e.kind == "change" for e in inv.evidence)
-    assert "a1b2c3d" in inv.hypotheses[0].statement
+    assert any("a1b2c3d" in h.statement for h in inv.hypotheses)
 
 
 def test_rules_choose_pre_onset_deploy_when_newer_deploy_is_present():
@@ -115,9 +151,10 @@ def test_rules_choose_pre_onset_deploy_when_newer_deploy_is_present():
 
 
 async def test_dependency_alert_becomes_hypothesis(lens):
-    await lens.handle_alerts(
-        [make_alert(name="ConnectionsExhausted", service="user-db", severity="warning", starts_at=START - timedelta(minutes=3))]
+    dep_alert = make_alert(
+        name="ConnectionsExhausted", service="user-db", severity="warning", starts_at=START - timedelta(minutes=3)
     )
+    await lens.handle_alerts([dep_alert])
     inv = await lens.investigator.investigate(target())
     dep = next(h for h in inv.hypotheses if "user-db" in h.statement)
     assert "ConnectionsExhausted" in dep.statement and dep.confidence == "medium"
@@ -139,7 +176,7 @@ async def test_injection_through_service_label_is_blocked(lens, world):
 async def test_memory_of_past_incident(lens, clock):
     await lens.handle_alerts([make_alert(starts_at=START, summary="p95 latency 450ms")])
     await lens.drain()
-    lens.record_feedback(1, 1, "alice")
+    lens.record_feedback(1, 2, "alice")
     clock.now += timedelta(minutes=20)
     await lens.handle_alerts([make_alert(status="resolved", starts_at=START, ends_at=clock.now)])
 
@@ -175,13 +212,13 @@ async def test_llm_rewrites_but_code_sets_confidence(tmp_path, clock):
         {
             "hypotheses": [
                 {
-                    "statement": "Deploy a1b2c3d introduced a memory leak in generateToken()",
-                    "evidence_ids": ["E3", "E4", "E5"],
+                    "statement": "Pod memory saturation is triggering OutOfMemoryError in generateToken()",
+                    "evidence_ids": ["E3", "E4"],
                     "confidence": "low",
                 },
                 {
-                    "statement": "Timing-only deploy correlation",
-                    "evidence_ids": ["E5"],
+                    "statement": "Deploy a1b2c3d may have introduced the leak",
+                    "evidence_ids": ["E3", "E4", "E5"],
                     "confidence": "high",
                 },
             ]
@@ -192,9 +229,33 @@ async def test_llm_rewrites_but_code_sets_confidence(tmp_path, clock):
     assert inv.engine == "llm"
     kinds = {e.id: e.kind for e in inv.evidence}
     assert kinds["E5"] == "change"
-    assert inv.hypotheses[0].statement.startswith("Deploy a1b2c3d")
-    assert inv.hypotheses[0].confidence == "high"  # metric + log override LLM's "low"
-    assert inv.hypotheses[1].confidence == "low"  # change-only overrides LLM's "high"
+    assert inv.hypotheses[0].statement.startswith("Pod memory saturation")
+    assert inv.hypotheses[0].confidence == "high"  # corroborating metric + log override LLM's "low"
+    assert inv.hypotheses[1].confidence == "low"  # deploy claim stays "low" even when LLM cites metric + log
+
+
+async def test_llm_cannot_raise_confidence_by_citing_extra_evidence_kinds(tmp_path, clock):
+    # Dependency alert yields a "medium" rule hypothesis (E5); even if the LLM also cites E1 (metric) and E4 (log)
+    # without citing any correlational kind, confidence cannot exceed what a single rule hypothesis supports ("medium").
+    reply = json.dumps(
+        {
+            "hypotheses": [
+                {
+                    "statement": "Database connection exhaustion is causing 5xx errors and log spikes",
+                    "evidence_ids": ["E1", "E4", "E5"],
+                }
+            ]
+        }
+    )
+    lens, world = llm_lens(tmp_path, clock, reply)
+    world.deploy_minutes_before = None
+    dep_alert = make_alert(
+        name="ConnectionsExhausted", service="user-db", severity="warning", starts_at=START - timedelta(minutes=3)
+    )
+    await lens.handle_alerts([dep_alert])
+    inv = await lens.investigator.investigate(target())
+    dep_hyp = inv.hypotheses[0]
+    assert dep_hyp.confidence == "medium"
 
 
 async def test_llm_hallucinated_evidence_is_dropped(tmp_path, clock):
@@ -309,8 +370,8 @@ async def test_malformed_llm_item_preserves_complete_rule_investigation(tmp_path
 
     assert inv.engine == "rules"
     assert {e.kind for e in inv.evidence} == {"metric", "log", "change"}
-    assert "a1b2c3d" in inv.hypotheses[0].statement
     assert inv.hypotheses[0].confidence == "high"
+    assert any("a1b2c3d" in h.statement and h.confidence == "low" for h in inv.hypotheses)
     assert all("partial response" not in h.statement for h in inv.hypotheses)
 
 

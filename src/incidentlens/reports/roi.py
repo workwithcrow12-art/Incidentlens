@@ -40,7 +40,6 @@ class RoiReport(BaseModel):
     interruptions: int  # Incidents that actually paged on-call
     interruptions_now: float  # Per responder per day
     interruptions_before: float | None
-    interruptions_before_estimated: bool
     incidents_before: int | None
     mttr_now: float | None
     mttr_before: float | None
@@ -77,12 +76,6 @@ def compute_roi(store: Store, baseline: Baseline, month_start: datetime, now: da
     investigations = store.investigations_between(start, end)
     rated = [r for r in investigations if r.feedback]
 
-    before = baseline.before.interruptions_per_person_per_day
-    estimated = before is None
-    if estimated and episodes:
-        # Unmeasured baseline: conservatively show what would happen if every episode interrupted on-call.
-        before = episodes / head / days
-
     return RoiReport(
         month=f"{start:%m/%Y}",
         days=days,
@@ -90,8 +83,7 @@ def compute_roi(store: Store, baseline: Baseline, month_start: datetime, now: da
         episodes=episodes,
         interruptions=len(incidents),
         interruptions_now=len(incidents) / head / days,
-        interruptions_before=before,
-        interruptions_before_estimated=estimated,
+        interruptions_before=baseline.before.interruptions_per_person_per_day,
         incidents_before=baseline.before.critical_incidents_per_month,
         mttr_now=fmean(durations) if durations else None,
         mttr_before=baseline.before.mttr_minutes,
@@ -114,7 +106,6 @@ def _change(before: float | None, now: float | None) -> str:
 
 
 def render_roi(r: RoiReport) -> str:
-    star = "*" if r.interruptions_before_estimated and r.interruptions_before is not None else ""
     accuracy = "—" if r.accuracy is None else f"{r.accuracy * 100:.0f}% ({r.feedback_up}/{r.feedback_total} rated)"
     lines = [
         f"# 📊 Monthly ROI Report {r.month}",
@@ -124,7 +115,7 @@ def render_roi(r: RoiReport) -> str:
         "",
         "| Metric | Pre-adoption | This month | Change |",
         "| :--- | ---: | ---: | ---: |",
-        f"| Interruptions / responder / day | {_num(r.interruptions_before, star, 2)} | "
+        f"| Interruptions / responder / day | {_num(r.interruptions_before, digits=2)} | "
         f"{_num(r.interruptions_now, digits=2)} | {_change(r.interruptions_before, r.interruptions_now)} |",
         f"| On-call incidents | {_num(r.incidents_before, digits=0)} | {r.interruptions} | "
         f"{_change(r.incidents_before, r.interruptions)} |",
@@ -137,13 +128,7 @@ def render_roi(r: RoiReport) -> str:
         "",
         "## Methodology",
         "- **Interruptions:** paged incidents (🔴 critical and escalated 🟡) divided by headcount and days.",
-    ]
-    if star:
-        lines.append(
-            "- **\\* Pre-adoption (estimated):** no measured baseline configured, assuming every alert episode "
-            "previously interrupted on-call. Set measured numbers in `config/baseline.yaml` for exact comparisons."
-        )
-    lines += [
+        "- **Pre-adoption:** measured baselines from `config/baseline.yaml`; shown as `—` until configured.",
         "- **MTTR:** mean duration from incident start to recovery across closed incidents.",
         "- **Confirmed hypotheses:** investigations marked ✅ divided by all rated investigations.",
         f"- **Time saved:** confirmed investigations × {r.minutes_per_correct} minutes. "

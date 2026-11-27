@@ -231,7 +231,7 @@ async def test_action_cooldown_and_same_incident_reconfirmation(tmp_path, clock,
     assert (await lens.run_action(1, "rollback", "U2", "bob", confirm_repeat=True)).startswith("⛔")
     assert len(executed) == 1
 
-    # After 301s cooldown has expired, but repeating rollback on the same incident still requires explicit re-confirmation.
+    # After 301s cooldown has expired, repeating rollback on the same incident still requires re-confirmation.
     clock.now += timedelta(seconds=181)
     unconfirmed = await lens.handle_interaction(
         "act_rollback", "1:rollback", "U2", "bob", "https://hooks.slack.com/actions/T/1/x"
@@ -296,3 +296,76 @@ async def test_action_refused_on_resolved_incident(tmp_path, clock, world):
     assert msg.startswith("⛔")
     assert executed == []
     assert [a.status for a in lens.store.actions_for_incident(1)] == ["denied"]
+
+
+async def test_started_action_audit_persists_before_completion_and_counts_toward_cooldown(tmp_path, clock, world):
+    db = f"sqlite:///{tmp_path / 'crash.db'}"
+    cfg = ActionsConfig(
+        actions={
+            "rollback": ActionSpec(
+                label="Rollback",
+                command=["kubectl", "rollout", "undo", "deployment/{service}"],
+                approvers=["U1", "U2"],
+                cooldown_seconds=300,
+            )
+        }
+    )
+
+    async def crashing_executor(argv, timeout):
+        raise RuntimeError("simulated worker crash mid-kubectl")
+
+    first = simulated_service(tmp_path / "a1", clock, world, actions=cfg, actions_enabled=True, database_url=db)
+    first.actions._executor = crashing_executor
+    await first.handle_alerts([make_alert(starts_at=START)])
+    await first.drain()
+
+    try:
+        await first.run_action(1, "rollback", "U1", "alice")
+    except RuntimeError:
+        pass
+
+    # Even though the process crashed mid-command, the `started` audit row is persisted.
+    restarted = simulated_service(tmp_path / "a2", clock, world, actions=cfg, actions_enabled=True, database_url=db)
+    audit = restarted.store.actions_for_incident(1)
+    assert [(a.action, a.status, a.user) for a in audit] == [("rollback", "started", "alice (U1)")]
+
+    # Cooldown blocks an immediate retry after restart.
+    clock.now += timedelta(seconds=60)
+    during_cd = await restarted.run_action(1, "rollback", "U2", "bob")
+    assert during_cd.startswith("⛔") and "cooldown" in during_cd
+
+    # Even after cooldown expires, repeating on the same incident requires explicit re-confirmation.
+    clock.now += timedelta(seconds=300)
+    after_cd = await restarted.run_action(1, "rollback", "U2", "bob")
+    assert after_cd.startswith("⛔") and "re-confirmation" in after_cd
+
+
+async def test_three_part_confirm_payload_is_rejected(tmp_path, clock, world):
+    executed = []
+
+    async def track_executor(argv, timeout):
+        executed.append(argv)
+        return 0, "ok"
+
+    cfg = ActionsConfig(
+        actions={
+            "rollback": ActionSpec(
+                label="Rollback",
+                command=["kubectl", "rollout", "undo", "deployment/{service}"],
+                approvers=["U1"],
+                cooldown_seconds=0,
+            )
+        }
+    )
+    lens = simulated_service(tmp_path, clock, world, actions=cfg, actions_enabled=True)
+    lens.actions._executor = track_executor
+    await lens.handle_alerts([make_alert(starts_at=START)])
+    await lens.drain()
+
+    assert (await lens.run_action(1, "rollback", "U1", "alice")).startswith("✅")
+    assert len(executed) == 1
+
+    # Legacy 3-part `:confirm` payload must be rejected instead of bypassing single-use prior_id check.
+    legacy = await lens.handle_interaction("act_confirm_rollback", "1:rollback:confirm", "U1", "alice", None)
+    assert legacy == "⚠️ Invalid action payload"
+    assert len(executed) == 1

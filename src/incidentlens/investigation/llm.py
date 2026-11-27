@@ -18,8 +18,8 @@ from typing import Protocol
 import httpx
 from pydantic import BaseModel
 
-from incidentlens.investigation.base import confidence_for
-from incidentlens.models import Evidence, Hypothesis, InvestigationTarget
+from incidentlens.investigation.base import CONFIDENCE_STRENGTH, confidence_for
+from incidentlens.models import Confidence, Evidence, Hypothesis, InvestigationTarget
 from incidentlens.redact import redact
 
 log = logging.getLogger(__name__)
@@ -115,6 +115,8 @@ class Synthesizer:
         self, target: InvestigationTarget, evidence: list[Evidence], draft: list[Hypothesis]
     ) -> list[Hypothesis] | None:
         """Return refined hypotheses, or None when the rule-based draft should be kept."""
+        if not draft:
+            return None
         payload = {
             "alert": {
                 "name": redact(target.name),
@@ -135,11 +137,26 @@ class Synthesizer:
                 statement = redact(item.statement.strip())[: self._max_statement]
                 if not ids or not statement:
                     continue  # Never emit a hypothesis without real collected evidence
+                raw_conf = confidence_for({kinds[i] for i in ids})
+                supported: Confidence = "low"
+                for d in draft:
+                    shared = set(ids) & set(d.evidence_ids)
+                    if not shared:
+                        continue
+                    from_draft = confidence_for({kinds[i] for i in shared if i in kinds})
+                    bounded = (
+                        from_draft
+                        if CONFIDENCE_STRENGTH[from_draft] <= CONFIDENCE_STRENGTH[d.confidence]
+                        else d.confidence
+                    )
+                    if CONFIDENCE_STRENGTH[bounded] > CONFIDENCE_STRENGTH[supported]:
+                        supported = bounded
+                confidence = raw_conf if CONFIDENCE_STRENGTH[raw_conf] <= CONFIDENCE_STRENGTH[supported] else supported
                 result.append(
                     Hypothesis(
                         statement=statement,
                         evidence_ids=ids,
-                        confidence=confidence_for({kinds[i] for i in ids}),
+                        confidence=confidence,
                     )
                 )
             return result[:3] or None

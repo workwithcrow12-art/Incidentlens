@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 import httpx
@@ -44,6 +45,28 @@ class Clock:
         return self.now
 
 
+_PROM_DQ_STRING = re.compile(r'"((?:\\.|[^"\\])*)"')
+_VALID_GO_ESCAPE = re.compile(
+    r'\\(?:[abfnrtv\\"]|[0-7]{3}|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})'
+)
+
+
+def validate_promql_strings(query: str) -> None:
+    """Validate Go double-quoted string escapes inside PromQL/LogQL queries."""
+    for match in _PROM_DQ_STRING.finditer(query):
+        content = match.group(1)
+        pos = 0
+        while pos < len(content):
+            idx = content.find("\\", pos)
+            if idx == -1:
+                break
+            esc = _VALID_GO_ESCAPE.match(content, idx)
+            if esc is None:
+                bad = content[idx : idx + 2]
+                raise ValueError(f"Invalid Go string escape {bad!r} in query: {query}")
+            pos = esc.end()
+
+
 class SimulatedWorld:
     """Simulated production environment where `broken` leaks memory shortly after a deployment."""
 
@@ -68,7 +91,9 @@ class SimulatedWorld:
 
     # Normal values before the incident; anomalous starting 4 minutes before alert firing.
     def _value(self, query: str, ts: float) -> float:
-        bad = self.broken in query and ts >= (self.incident_start - timedelta(minutes=4)).timestamp()
+        escaped_broken = self.broken.replace(".", r"\\.")
+        matches_service = self.broken in query or escaped_broken in query
+        bad = matches_service and ts >= (self.incident_start - timedelta(minutes=4)).timestamp()
         if "memory" in query:
             return float(900 * 2**20 if bad else 200 * 2**20)
         if "5.." in query:
@@ -85,6 +110,10 @@ class SimulatedWorld:
             return httpx.Response(503, text="unavailable")
 
         if host == "prometheus.test" and path == "/api/v1/query_range":
+            try:
+                validate_promql_strings(q["query"])
+            except ValueError as exc:
+                return httpx.Response(400, json={"status": "error", "error": str(exc)})
             start, end, step = float(q["start"]), float(q["end"]), float(q["step"])
             values: list[list[Any]] = []
             ts = start
@@ -93,7 +122,10 @@ class SimulatedWorld:
                 ts += step
             return httpx.Response(
                 200,
-                json={"status": "success", "data": {"resultType": "matrix", "result": [{"metric": {}, "values": values}]}},
+                json={
+                    "status": "success",
+                    "data": {"resultType": "matrix", "result": [{"metric": {}, "values": values}]},
+                },
             )
 
         if host == "loki.test" and path == "/loki/api/v1/query":
@@ -119,23 +151,35 @@ class SimulatedWorld:
             lines += [[q["end"], "ERROR connection reset by peer 10.0.0.7:5432"]] * 6
             return httpx.Response(
                 200,
-                json={"status": "success", "data": {"resultType": "streams", "result": [{"stream": {}, "values": lines}]}},
+                json={
+                    "status": "success",
+                    "data": {"resultType": "streams", "result": [{"stream": {}, "values": lines}]},
+                },
             )
 
         if host == "api.github.com" and path.endswith("/deployments"):
             if self.broken not in path or self.deploy_minutes_before is None:
+                return httpx.Response(200, json=[])
+            if q.get("environment") not in (None, "production"):
+                return httpx.Response(200, json=[])
+            if int(q.get("page", "1")) > 1:
                 return httpx.Response(200, json=[])
             at_dt = self.incident_start - timedelta(minutes=self.deploy_minutes_before)
             return httpx.Response(
                 200,
                 json=[
                     {
+                        "id": 1,
+                        "environment": "production",
                         "sha": "a1b2c3d4e5f6a7b8c9d0",
                         "created_at": at_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "creator": {"login": "dev-a"},
                     }
                 ],
             )
+
+        if host == "api.github.com" and path.endswith("/deployments/1/statuses"):
+            return httpx.Response(200, json=[{"state": "success"}])
 
         if host == "slack.com" and path == "/api/chat.postMessage":
             self.slack.append(json.loads(request.content))

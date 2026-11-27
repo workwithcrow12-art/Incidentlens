@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from incidentlens.markdown import md_code, md_text, md_url
 from incidentlens.models import CONFIDENCE_LABEL, ActionRecord, IncidentRecord, InvestigationRecord
 
 _TODO = "_To be determined — owner review required._"
@@ -27,19 +28,19 @@ def render_postmortem(
             )
         )
     for a in actions:
-        timeline.append((a.at, f"{a.user} triggered action `{a.action}` → {a.status}"))
+        timeline.append((a.at, f"{md_text(a.user)} triggered action {md_code(a.action)} → {md_text(a.status)}"))
     if incident.resolved_at:
         timeline.append((incident.resolved_at, "Resolved"))
     timeline.sort(key=lambda item: item[0])
 
     lines = [
-        f"# Postmortem (draft) · {incident.code} · {incident.name} on `{incident.service}`",
+        f"# Postmortem (draft) · {incident.code} · {md_text(incident.name)} on {md_code(incident.service)}",
         "",
         "> Auto-generated draft from recorded incident data. Review and complete before sharing.",
         "",
         "## Summary",
-        f"- **Description:** {incident.summary}",
-        f"- **Service:** `{incident.service}` · **Owner:** {team}",
+        f"- **Description:** {md_text(incident.summary)}",
+        f"- **Service:** {md_code(incident.service)} · **Owner:** {md_text(team)}",
         f"- **Classification:** {origin}",
         f"- **Started:** {incident.started_at:%Y-%m-%d %H:%M} UTC · **Resolved:** {resolved}",
         f"- **Duration:** {duration}",
@@ -48,7 +49,7 @@ def render_postmortem(
         *[f"- {at:%m-%d %H:%M} — {text}" for at, text in timeline],
         "",
         "## Root cause",
-        incident.root_cause or _TODO,
+        md_text(incident.root_cause) if incident.root_cause else _TODO,
     ]
 
     for rec in investigations:
@@ -60,20 +61,25 @@ def render_postmortem(
         for n, h in enumerate(inv.hypotheses, 1):
             mark = ""
             if rec.feedback == "up" and rec.feedback_hypothesis == n:
-                mark = f" ✅ _(confirmed by {rec.feedback_by})_"
-            lines.append(
-                f"{n}. **[{CONFIDENCE_LABEL[h.confidence]}]** {h.statement} ({', '.join(h.evidence_ids)}){mark}"
-            )
+                mark = f" ✅ _(confirmed by {md_text(rec.feedback_by or '')})_"
+            label = CONFIDENCE_LABEL[h.confidence]
+            ev_ids = ", ".join(h.evidence_ids)
+            lines.append(f"{n}. **[{label}]** {md_text(h.statement)} ({ev_ids}){mark}")
             cited += [i for i in h.evidence_ids if i not in cited]
         if rec.feedback == "down":
-            lines.append(f"\n_👎 {rec.feedback_by} marked: none of the hypotheses were correct._")
+            lines.append(f"\n_👎 {md_text(rec.feedback_by or '')} marked: none of the hypotheses were correct._")
         lines += ["", "### Evidence"]
-        lines += [f"- **{e.id}** [{e.description}]({e.url})" for e in inv.evidence if e.id in cited]
+        for e in inv.evidence:
+            if e.id not in cited:
+                continue
+            safe_url = md_url(e.url)
+            desc = md_text(e.description)
+            lines.append(f"- **{e.id}** [{desc}]({safe_url})" if safe_url else f"- **{e.id}** {desc}")
 
     lines += [
         "",
         "## Resolution",
-        incident.fix or _TODO,
+        md_text(incident.fix) if incident.fix else _TODO,
         "",
         "## Lessons learned and follow-ups",
         "- [ ] What prevents this incident from recurring?",

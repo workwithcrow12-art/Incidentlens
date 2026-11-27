@@ -30,15 +30,18 @@ class LokiClient:
         self._grafana = grafana_url.rstrip("/") if grafana_url else None
         self._datasource = grafana_datasource
 
-    async def count(self, query: str, at: datetime, window_seconds: int) -> int:
-        """Return matching log line count within `window_seconds` ending at `at`."""
+    async def count(self, query: str, at: datetime, window_seconds: int) -> int | None:
+        """Return matching log line count within `window_seconds` ending at `at`, or None when empty."""
         resp = await self._client.get(
             f"{self._base}/loki/api/v1/query",
             params={"query": f"sum(count_over_time({query}[{window_seconds}s]))", "time": _ns(at)},
         )
         resp.raise_for_status()
-        result = resp.json().get("data", {}).get("result", [])
-        return int(float(result[0]["value"][1])) if result else 0
+        body = resp.json()
+        if "status" in body and body["status"] != "success":
+            raise RuntimeError(f"Loki error: {body.get('error', 'unknown')}")
+        result = body.get("data", {}).get("result", [])
+        return int(float(result[0]["value"][1])) if result else None
 
     async def lines(self, query: str, start: datetime, end: datetime, limit: int = 100) -> list[str]:
         resp = await self._client.get(

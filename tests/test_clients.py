@@ -67,6 +67,21 @@ async def test_loki_count_and_lines(world):
     assert len(lines) == 46 and "OutOfMemoryError" in lines[0]
 
 
+async def test_loki_empty_result_returns_none_while_zero_returns_zero():
+    empty_resp = {"status": "success", "data": {"result": []}}
+    empty = LokiClient("http://loki.test", mock(lambda r: httpx.Response(200, json=empty_resp)))
+    assert await empty.count('{service="auth-service"}', START, 300) is None
+
+    zero_body = {"status": "success", "data": {"result": [{"metric": {}, "value": [1, "0"]}]}}
+    quiet = LokiClient("http://loki.test", mock(lambda r: httpx.Response(200, json=zero_body)))
+    assert await quiet.count('{service="auth-service"}', START, 300) == 0
+
+    err_resp = {"status": "error", "error": "bad logql"}
+    err = LokiClient("http://loki.test", mock(lambda r: httpx.Response(200, json=err_resp)))
+    with pytest.raises(RuntimeError, match="bad logql"):
+        await err.count('{service="auth-service"}', START, 300)
+
+
 def test_loki_links():
     plain = LokiClient("http://loki.test", None).explore_url("{a}", START, START)
     assert plain.startswith("http://loki.test/loki/api/v1/query_range?")
@@ -93,6 +108,87 @@ async def test_github_deployments(world):
 
     world.fail_hosts.add("api.github.com")
     assert await gh.recent_changes("auth-service", START - timedelta(hours=2)) == []  # Graceful degradation
+
+
+async def test_github_filters_environment_status_and_paginates():
+    catalog = ServiceCatalog.from_yaml(CONFIG / "services.yaml")
+    seen_envs: list[str | None] = []
+    seen_pages: list[int] = []
+    at = (START - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    statuses_by_id = {
+        10: [{"state": "failure"}],
+        11: [{"state": "in_progress"}],
+        12: [],
+        13: [{"state": "inactive"}, {"state": "failure"}],
+        14: [{"state": "inactive"}, {"state": "success"}],
+        15: [{"state": "success"}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/deployments"):
+            seen_envs.append(request.url.params.get("environment"))
+            page = int(request.url.params.get("page", "1"))
+            seen_pages.append(page)
+            if page == 1:
+                # 25 staging/failed deploys on page 1 (per_page=25) would previously push out page 2's prod deploy.
+                items = [
+                    {
+                        "id": 100 + i,
+                        "environment": "staging",
+                        "sha": f"stage{i:04d}",
+                        "created_at": at,
+                        "creator": {"login": "ci"},
+                    }
+                    for i in range(21)
+                ] + [
+                    {
+                        "id": dep_id,
+                        "environment": "production",
+                        "sha": sha,
+                        "created_at": at,
+                        "creator": {"login": login},
+                    }
+                    for dep_id, sha, login in [
+                        (10, "failed00", "dev-f"),
+                        (11, "inprog00", "dev-p"),
+                        (12, "nostat00", "dev-n"),
+                        (13, "inactf00", "dev-x"),
+                    ]
+                ]
+                return httpx.Response(200, json=items)
+            if page == 2:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": 14,
+                            "environment": "production",
+                            "sha": "supersed1234",
+                            "created_at": (START - timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "creator": {"login": "dev-old"},
+                        },
+                        {
+                            "id": 15,
+                            "environment": "production",
+                            "sha": "goodprod1234",
+                            "created_at": (START - timedelta(minutes=25)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "creator": {"login": "dev-ok"},
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+        for dep_id, st in statuses_by_id.items():
+            if path.endswith(f"/deployments/{dep_id}/statuses"):
+                return httpx.Response(200, json=st)
+        return httpx.Response(404)
+
+    gh = GitHubChangeProvider("tok", catalog, mock(handler), per_page=25)
+    changes = await gh.recent_changes("auth-service", START - timedelta(hours=2))
+    assert seen_envs == ["production", "production"]
+    assert seen_pages == [1, 2]
+    assert [c.ref for c in changes] == ["goodpro", "superse"]
 
 
 async def test_slack_bot_webhook_and_dry_run(world):

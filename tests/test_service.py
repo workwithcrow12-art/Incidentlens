@@ -96,8 +96,8 @@ async def test_full_incident_lifecycle(tmp_path, clock):
     await lens.handle_alerts([make_alert(**CRIT)])
     await lens.drain()
 
-    # Engineer confirms hypothesis 1 -> populates incident root cause
-    msg = await lens.handle_interaction("fb_1", "1:1", "U1", "alice", "https://hooks.slack.com/actions/x")
+    # Engineer confirms hypothesis 2 (deploy) -> populates incident root cause
+    msg = await lens.handle_interaction("fb_2", "1:2", "U1", "alice", "https://hooks.slack.com/actions/x")
     assert msg.startswith("✅") and world.slack[-1]["text"] == msg
     assert "a1b2c3d" in lens.store.get_incident(1).root_cause
 
@@ -274,7 +274,7 @@ async def test_digest_with_hypothesis(lens, world, clock):
 
     assert "2 groups" in text and "**Priority: #1**" in text
     assert "🟡 #1 MemoryHigh" in text and "Platform Team" in text
-    assert "**Hypothesis [High]:** Deploy `a1b2c3d`" in text and "Evidence: [" in text
+    assert "**Hypothesis [High]:** Resources on `auth-service`" in text and "Evidence: [" in text
     assert "HighLatency" not in text
     assert "- [x] ⚪ #2 `payment-worker` Timeout" in text
     assert len(world.slack) == 1 and "New digest" in world.slack[0]["text"]
