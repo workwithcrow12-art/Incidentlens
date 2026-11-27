@@ -4,6 +4,28 @@
 
 Every defect below was reproduced with a failing regression test first and verified after applying the fix.
 
+### Fifth review round (2026-11-27)
+
+| ID | Repaired behavior | Regression coverage |
+| --- | --- | --- |
+| R37 | `LokiClient.count()` checks the unfiltered stream selector (`{service="..."}`) when a filtered LogQL query returns an empty vector (`grafana/loki#6946`), returning `0` when the service logged non-error lines and `None` only when logs are absent, so healthy services with 0 baseline errors report sudden error spikes. | `test_loki_filtered_empty_result_distinguishes_zero_errors_from_no_logs`, `test_zero_error_baseline_reports_sudden_error_spike`, `test_missing_loki_baseline_creates_no_false_log_evidence` |
+| R38 | `Store` runs `_migrate()` at startup to add missing columns (`incidents.pager_key`, `notification_deliveries.created_at`) and indexes to pre-existing databases, backfilling legacy `created_at` and `pager_key` values. | `test_legacy_database_upgrades_missing_columns_on_startup` |
+| R39 | `docker-compose.yml` mounts a named `digests` volume (`digests:/app/digests`) instead of a host bind mount so UID `10001` can write digests and postmortems on a fresh Linux clone without manual `chown`. | `test_compose_binds_loopback_and_requires_webhook_token` |
+
+### Fourth review round (2026-11-27)
+
+| ID | Repaired behavior | Regression coverage |
+| --- | --- | --- |
+| R28 | Retention purges old resolved `critical` alerts, `interaction_claims`, and finished `notification_deliveries` (for closed incidents or orphaned `incident_id IS NULL` rows) while retaining open/pending deliveries, undigested warnings, and `incidents.pager_key`. | `test_maintenance_publishes_last_month_once_and_purges`, `test_purge_keeps_open_or_pending_deliveries_and_undigested_warnings` |
+| R29 | `render_service_query()` escapes dots with Go-valid `\\.` inside double-quoted PromQL `=~` matchers so dotted service names (`svc.v2`) collect pod metrics cleanly. | `test_shipped_config_is_valid_and_pod_queries_do_not_match_other_services`, `test_dotted_service_name_collects_pod_metrics_without_warnings` |
+| R30 | Remediation actions persist a `started` audit row before subprocess launch (enforcing cooldown and re-confirmation even across mid-command crashes) and reject legacy 3-part `:confirm` payloads. | `test_started_action_audit_persists_before_completion_and_counts_toward_cooldown`, `test_three_part_confirm_payload_is_rejected` |
+| R31 | GitHub deployment correlation filters by service `environment`, paginates past non-production/failed deployments, and accepts only deployments whose latest non-`inactive` status is `success`. | `test_github_filters_environment_status_and_paginates` |
+| R32 | Correlational evidence (`change`, `memory`) remains `low` confidence, resource-saturation hypotheses require saturation-related logs to reach `high`, and LLM-refined confidence is capped by the rule draft. | `test_confidence_rules`, `test_unrelated_error_logs_do_not_raise_saturation_to_high`, `test_llm_cannot_raise_confidence_by_citing_extra_evidence_kinds` |
+| R33 | Markdown digests and postmortems escape untrusted text/code spans and permit only `http://`/`https://` links. | `test_markdown_outputs_escape_injected_links_and_unsafe_urls` |
+| R34 | Blocking SQLAlchemy and Git archive calls offload to worker threads (`asyncio.to_thread`) so slow DB operations do not stall the async event loop. | `test_slow_database_call_does_not_block_async_event_loop` |
+| R35 | `Dockerfile` uses `uv sync --locked` and runs as non-root `incidentlens` (`10001:10001`); CI enforces `ruff check`. | `test_dockerfile_uses_locked_uv_and_non_root_user` |
+| R36 | Shipped `config/baseline.yaml` leaves pre-adoption metrics unset (`null`) until measured, rendering `—` instead of estimated defaults. | `test_roi_numbers`, `test_roi_with_measured_baseline` |
+
 ### Third review round (2026-11-26)
 
 | ID | Repaired behavior | Regression coverage |
@@ -52,17 +74,17 @@ Every defect below was reproduced with a failing regression test first and verif
 - Notification retries run every `IL_ESCALATION_CHECK_SECONDS` (60 seconds by default), or via `POST /escalations/check` when schedules are disabled. Unconfigured channels (`DeliveryStatus.NOT_CONFIGURED`) are not queued for retries.
 - Slack interaction replay deduplication is atomic across store instances. In addition, approved actions acquire a per-service lock, refuse resolved incidents, and enforce `cooldown_seconds` after any executed action on that service.
 
-## Local and Docker verification summary
+## Local and CI verification summary
 
-Verified on **2026-11-26** across local Windows and Linux Docker (`python:3.12-slim` + `pgvector/pgvector:pg16`):
+Verified on **2026-11-27** across local Windows and GitHub Actions Linux (`Python 3.11`, `Python 3.12`, and `pgvector/pgvector:pg16`, commit `1d58df7`):
 
-- **214 tests passed** with **98% statement coverage** on both SQLite and live PostgreSQL 16 (`pgvector/pgvector:pg16`).
-- **`mypy src scripts` passed** with zero errors across 38 files.
-- The offline lifecycle demonstration (`scripts/demo.py`) completed cleanly locally and inside Docker.
-- Source (`sdist`) and wheel (`bdist_wheel`) distributions built cleanly (`uv build`).
-- Production `Dockerfile` image and live `docker compose` stack (`incidentlens` + `pgvector/pgvector:pg16`) verified end-to-end: empty-token Compose guard, loopback port binding (`127.0.0.1:8000`), `401` bearer-token enforcement, `scripts/send_sample.sh`, postmortem/ROI/digest generation, Slack HMAC signature + replay deduplication, and PostgreSQL persistence across container restarts.
+- **234 tests passed** with **98% statement coverage** on SQLite (local and CI) and live PostgreSQL 16 (CI).
+- **`ruff check src tests scripts`** and **`mypy src scripts`** passed with zero errors across 39 source files.
+- The offline lifecycle demonstration (`scripts/demo.py`) and source/wheel builds (`uv build`) completed cleanly.
+- The earlier `Dockerfile` + `docker compose` stack was exercised end-to-end on **2026-11-26** before the non-root UID `10001` and named `digests` volume changes (R35, R39); re-verifying the updated Compose stack on Linux remains in the staging checklist below.
 
 ```bash
+python -m ruff check src tests scripts
 python -m mypy src scripts
 python -m pytest --cov=incidentlens --cov-report=term-missing
 python -X utf8 scripts/demo.py
@@ -86,5 +108,5 @@ Remove-Item Env:IL_TEST_DATABASE_URL
 | Secret redaction | Key-value prefixes/suffixes, URL credentials, JWTs, Bearer/Basic auth, AWS/GitHub/Slack tokens, emails, Luhn cards, phone numbers | Organization-specific proprietary secret formats and adversarial log payloads |
 | Human actions | Slack HMAC verification, approver lists, command allowlists, durable replay claims, resolved-incident refusal, per-service lock and cooldown | Staging validation of allowed commands, `kubectl` availability, and RBAC scopes |
 | Human authorship | Manual root causes are preserved across hypothesis feedback; `GET /incidents/{id}/postmortem` is read-only | Multi-editor postmortem collaboration workflows |
-| Retention & ROI | Old episodes and resolved+digested alerts purged; feedback accuracy, MTTR, and estimated hours saved reported | Measured pre-adoption baselines and observed pilot time savings |
-| Deployment | Local server, typechecking, lockfile, CI workflow, and distribution builds verified | Live Docker Compose, backup/restore drills, schema migrations, and Grafana links |
+| Retention & ROI | Old resolved critical alerts, resolved+digested action/info alerts, episodes, interaction claims, and finished deliveries for closed/orphan records purged while preserving `incidents.pager_key`; feedback accuracy, MTTR, and estimated hours saved reported | Measured pre-adoption baselines and observed pilot time savings |
+| Deployment | Local server, `ruff`, `mypy`, lockfile, CI (`Python 3.11/3.12` + PostgreSQL 16), distribution builds, and SQLite additive column/index startup upgrades | Re-verifying the updated non-root Docker Compose stack on Linux (named `digests` volume), PostgreSQL upgrade/backup/restore drills and non-additive migrations, and Grafana links |

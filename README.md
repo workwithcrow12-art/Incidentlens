@@ -2,7 +2,7 @@
 
 IncidentLens receives infrastructure alerts, pages on-call through deterministic YAML routing rules, and investigates in the background. It correlates Prometheus metrics, Loki logs, GitHub deployments, dependency alerts, and past incidents into evidence-linked hypotheses, while batching lower-priority alerts into scheduled Markdown digests.
 
-**Status: prototype verified locally and in Docker + PostgreSQL 16 (214 tests, 98% coverage, strict `mypy`); staging validation is required before enabling live actions or production log ingestion.** See [docs/verification-and-repairs.md](docs/verification-and-repairs.md) for the full repair history and verification matrix.
+**Status: prototype verified locally and in GitHub Actions (Python 3.11/3.12 + PostgreSQL 16: 234 tests, 98% coverage, `ruff`, `mypy`); staging validation is required before enabling live actions or production log ingestion.** See [docs/verification-and-repairs.md](docs/verification-and-repairs.md) for the full repair history and verification matrix.
 
 ## How it works
 
@@ -97,8 +97,9 @@ Copy-Item .env.example .env
 
 ```bash
 python -X utf8 scripts/demo.py
-python -m pytest --cov=incidentlens --cov-report=term-missing
+python -m ruff check src tests scripts
 python -m mypy src scripts
+python -m pytest --cov=incidentlens --cov-report=term-missing
 ```
 
 `scripts/demo.py` mocks Prometheus, Loki, GitHub, Slack, and PagerDuty at the HTTP transport layer and writes sample digests, postmortems, and ROI reports into `demo-output/`.
@@ -171,5 +172,5 @@ All endpoints except `/healthz` and `/slack/interactions` require `Authorization
 - `src/incidentlens/ingest/`, `routing/` — Alertmanager normalization and YAML rule evaluation
 - `src/incidentlens/investigation/`, `changes/`, `memory/` — Prometheus/Loki/GitHub collectors, anomaly detection, incident similarity, and optional LLM synthesis
 - `src/incidentlens/actions/`, `digest/`, `reports/`, `outputs/` — Guarded command runner, Markdown digests/postmortems/ROI, Slack cards, PagerDuty, and Git archive sync
-- [docs/verification-and-repairs.md](docs/verification-and-repairs.md) — Repair log (R1–R27), verification commands, and staging checklist
+- [docs/verification-and-repairs.md](docs/verification-and-repairs.md) — Repair log (R1–R39), verification commands, and staging checklist
 - [LICENSE](LICENSE) — MIT License
